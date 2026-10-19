@@ -332,6 +332,30 @@ ${L.d.spoolman ? '<div class="f"><small>Spoolman: verbruik aftrekken van spoel</
 <div class="f"><small>Notitie</small><input id="ln" placeholder="bijv. 0.2 mm, 15% infill"></div>
 <button class="p" id="lsave">Opslaan in logboek</button></div>`;
 }
+function bbHTML(m) {
+  if (!L.d.bambuddy || !['3mf', 'gcode', 'stl'].includes(m.ext)) return '';
+  return `<button id="vbbbtn" title="Het model naar Bambuddy sturen">↗ Naar Bambuddy…</button>
+<div id="vbbform" style="display:none"><div class="f"><small>Printer (voor de wachtrij)</small><select id="bbp"><option value="">Laden…</option></select></div>
+<div class="row"><button id="bblib" title="Alleen in de bibliotheek van Bambuddy zetten">In bibliotheek zetten</button><button class="p" id="bbq" title="In de wachtrij van Bambuddy zetten; starten doe je daar zelf" ${m.ext === 'stl' ? 'disabled' : ''}>In wachtrij zetten</button></div>
+<small class="dim">Er wordt niets gestart. Starten doe je zelf in Bambuddy.${m.ext === 'stl' ? ' De wachtrij van Bambuddy neemt alleen geslicede bestanden (.gcode of .gcode.3mf) aan.' : ''}</small></div>`;
+}
+async function openBbForm() {
+  const f = $('#vbbform'); f.style.display = f.style.display === 'none' ? '' : 'none';
+  if (f.style.display === 'none') return;
+  try {
+    const r = await api('/api/bambuddy/status');
+    if (!r.ok) { $('#bbp').innerHTML = '<option value="">Niet beschikbaar</option>'; return toast(r.error || 'Bambuddy is niet ingesteld', 'err'); }
+    $('#bbp').innerHTML = '<option value="">Kies een printer…</option>' + r.printers.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function sendToBambuddy(action) {
+  const pid = $('#bbp').value;
+  if (action === 'queue' && !pid) return toast('Kies eerst een printer', 'info');
+  const m = cur();
+  if (!confirm(action === 'queue' ? `"${label(m)}" naar Bambuddy sturen en in de wachtrij van de gekozen printer zetten?\nEr wordt niets gestart.` : `"${label(m)}" naar de bibliotheek van Bambuddy sturen?`)) return;
+  const r = await api(`/api/models/${m.id}/bambuddy`, 'POST', {action, printer_id: pid ? +pid : null});
+  toast(action === 'queue' ? `In de wachtrij van Bambuddy gezet (#${r.queue_item_id}${r.queue_status ? ', status: ' + r.queue_status : ''})` : r.duplicate ? 'Verstuurd (Bambuddy had dit bestand al)' : 'In de bibliotheek van Bambuddy gezet');
+}
 async function loadLogs(id) {
   L.logs[id] = await api(`/api/models/${id}/prints`);
   if (openId === id && $('#vlogs')) { $('#vlogs').innerHTML = logLines(cur()); $('#vlogcnt').textContent = `(${logCount(cur())})`; }
@@ -371,6 +395,7 @@ ${fitHTML(m)}${infoHTML(m)}
 <div class="f"><small>Categorie toevoegen</small><div class="row"><select id="vsel"><option value="">Kies een categorie…</option>${avail.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}<option value="__new">+ Nieuwe categorie…</option></select><button id="vadd">Toevoegen</button></div>
 <input id="vnew" placeholder="Naam nieuwe categorie (Enter)" style="display:none;margin-top:6px"></div>
 ${logHTML(m)}
+${bbHTML(m)}
 <div class="row" style="margin-top:auto"><button id="vslic" title="De slicer haalt het bestand zelf op via een tijdelijke link">▶ Openen in ${esc(L.d.slicer.name)}</button>${L.d.local ? '<button id="vopen" title="Met het standaardprogramma van je computer">Openen met standaardprogramma</button>' : ''}</div>
 <div class="row"><button id="vsnap" title="Draai het model en gebruik de huidige weergave als thumbnail">📷 Weergave als thumbnail</button></div>
 <div class="row"><button id="vre" title="Terug naar de automatische thumbnail">Thumbnail opnieuw</button><a class="btn" href="/api/file/${m.id}" download>⬇ Download</a><button id="vx">Sluiten</button></div>`;
@@ -442,6 +467,9 @@ $('#modal').onclick = run(async e => {
   }
   if (t.id === 'vopen') { await api(`/api/models/${openId}/open`, 'POST'); return toast('Geopend met het standaardprogramma'); }
   if (t.id === 'vlogbtn') return openLogForm();
+  if (t.id === 'vbbbtn') return openBbForm();
+  if (t.id === 'bblib') return sendToBambuddy('library');
+  if (t.id === 'bbq') return sendToBambuddy('queue');
   if (t.dataset.delprint) {
     if (!confirm('Deze logregel verwijderen? Verbruik dat al in Spoolman is afgetrokken blijft daar staan.')) return;
     await api('/api/prints/' + t.dataset.delprint, 'DELETE'); await loadLogs(openId); await reloadLib(); return toast('Logregel verwijderd');
@@ -652,7 +680,7 @@ V['settings/categories'] = async () => {
 };
 V['settings/auto'] = async () => {
   $('#title').textContent = 'Instellingen — Automatisch indelen';
-  const FIELDS = {path: 'pad bevat', name: 'naam bevat', ext: 'extensie is'};
+  const FIELDS = {path: 'pad bevat', name: 'naam bevat', ext: 'extensie is', folder: 'map is'};
   let F = {folders: [], loose: 0, total: 0}, R = [], C = [], filter = '';
   const pick = new Map();  // mapnaam -> {on, cat}
   const folderRows = () => F.folders.filter(f => !filter || f.name.toLowerCase().includes(filter)).map(f => {
@@ -768,6 +796,7 @@ V['settings/users'] = async () => {
   });
   await load();
 };
+const bbInfo = sy => !sy || !sy.last ? '' : sy.error ? 'Laatste synchronisatie mislukt: ' + sy.error : `Laatste synchronisatie: ${fdate(sy.last)}. ${sy.result.added} nieuw, ${sy.result.known} al bekend, ${sy.result.unmatched} zonder bijpassend model${sy.result.examples.length ? ' (' + sy.result.examples.join(', ') + ')' : ''}.`;
 V['settings/general'] = async () => {
   $('#title').textContent = 'Instellingen — Algemeen';
   const s = await api('/api/settings');
@@ -775,11 +804,17 @@ V['settings/general'] = async () => {
 <h3>Gebruikers en toegang</h3><p class="dim">Accounts, inloggen en gasten die modellen mogen bekijken en downloaden beheer je onder <a href="#/settings/users">Instellingen → Gebruikers</a>.</p>
 <h3>Slicer</h3><div class="form"><label>"Openen in slicer" via link</label><select id="slc">${[['bambustudio', 'Bambu Studio'], ['orcaslicer', 'OrcaSlicer'], ['prusaslicer', 'PrusaSlicer']].map(([v, n]) => `<option value="${v}" ${s.slicer === v ? 'selected' : ''}>${n}</option>`).join('')}</select><small>De slicer haalt het bestand zelf op via een tijdelijke link (10 minuten), dus het adres van deze app moet vanaf je computer bereikbaar zijn. Lukt dat niet, download het bestand of gebruik "Openen met standaardprogramma" (alleen als de app op deze computer draait).</small><span></span><button class="p" id="slsave">Opslaan</button></div>
 <h3>Spoolman</h3><div class="form"><label>Adres van Spoolman</label><input id="smu" value="${esc(s.spoolman_url)}" placeholder="http://spoolman:7912"><small>Optioneel. Dan kun je bij een print het verbruik van een spoel laten aftrekken. De app moet Spoolman kunnen bereiken (in Docker: de containernaam of het NAS-adres).</small><span></span><div class="row"><button class="p" id="smsave">Opslaan</button><button id="smtest">Verbinding testen</button></div></div>
+<h3>Bambuddy</h3><div class="form"><label>Adres van Bambuddy</label><input id="bbu" value="${esc(s.bambuddy_url)}" placeholder="http://192.168.1.20:8000"><label>API-sleutel van Bambuddy</label><input id="bbk" type="password" autocomplete="off" value="" placeholder="${s.bambuddy_key_set ? '•••••••• (opgeslagen, leeg laten om te behouden)' : 'Plak hier de sleutel uit Bambuddy'}"><small>Optioneel. Maak in Bambuddy onder Instellingen → API Keys een sleutel. Daarmee kun je een model naar Bambuddy sturen (bibliotheek of wachtrij) en wordt de printgeschiedenis van Bambuddy elke 30 minuten overgenomen in het printlogboek. De sleutel wordt in de database van deze app opgeslagen en nooit teruggestuurd naar de browser.</small><span></span><div class="row"><button class="p" id="bbsave">Opslaan</button><button id="bbtest">Verbinding testen</button><button id="bbsync">Nu synchroniseren</button><button id="bbclear">Sleutel wissen</button></div><span></span><small id="bbinfo" class="dim"></small></div>
 <h3>API-sleutel</h3><div class="form"><label>Sleutel</label><input id="ak" readonly value="${esc(s.api_key)}"><small>Meesturen als header X-Api-Key om zonder wachtwoord bij de API te komen.</small><span></span><button id="rk">Nieuwe sleutel genereren</button></div>`;
+  if (s.bambuddy_url && s.bambuddy_key_set) api('/api/bambuddy/status').then(r => { if ($('#bbinfo')) $('#bbinfo').textContent = bbInfo(r.sync); }).catch(() => {});
   $('#view').onclick = run(async e => {
     const t = e.target;
     if (t.id === 'slsave') { await api('/api/settings', 'POST', {slicer: $('#slc').value}); toast('Slicer opgeslagen'); }
     if (t.id === 'smsave') { await api('/api/settings', 'POST', {spoolman_url: $('#smu').value}); toast($('#smu').value.trim() ? 'Spoolman-adres opgeslagen' : 'Spoolman uitgeschakeld'); }
+    if (t.id === 'bbsave') { const b = {bambuddy_url: $('#bbu').value}; if ($('#bbk').value.trim()) b.bambuddy_key = $('#bbk').value.trim(); await api('/api/settings', 'POST', b); toast('Bambuddy opgeslagen'); return V['settings/general'](); }
+    if (t.id === 'bbclear' && confirm('De opgeslagen Bambuddy-sleutel wissen? De koppeling staat dan uit.')) { await api('/api/settings', 'POST', {bambuddy_key_clear: true}); toast('Sleutel gewist'); return V['settings/general'](); }
+    if (t.id === 'bbtest') { const r = await api('/api/bambuddy/status'); if (!r.configured) toast('Vul eerst adres en sleutel in en klik op Opslaan', 'info'); else if (r.ok) toast(`Verbonden met Bambuddy: ${r.printers.length} ${r.printers.length === 1 ? 'printer' : 'printers'}`); else toast(r.error, 'err'); }
+    if (t.id === 'bbsync') { const r = await api('/api/bambuddy/sync', 'POST'); const x = r.result; toast(`${x.added} nieuwe prints overgenomen` + (x.unmatched ? `, ${x.unmatched} zonder bijpassend model` : ''), 'info'); $('#bbinfo').textContent = bbInfo(r); }
     if (t.id === 'smtest') { const r = await api('/api/spoolman/status'); if (!r.configured) toast('Vul eerst het adres in en klik op Opslaan', 'info'); else if (r.ok) toast('Verbonden met Spoolman ' + (r.version || '')); else toast(r.error, 'err'); }
     if (t.id === 'rk' && confirm('Nieuwe API-sleutel genereren? De oude werkt dan niet meer.')) { await api('/api/settings', 'POST', {regen_key: true}); toast('Nieuwe API-sleutel'); V['settings/general'](); }
   });

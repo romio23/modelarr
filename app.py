@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import render
 from PIL import Image
 
-VERSION = '1.1.1'
+VERSION = '1.2.2'
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.abspath(os.environ.get('CONFIG_DIR', os.path.join(BASE, 'config')))
 BACKUP_ENV = os.environ.get('BACKUP_DIR', '').strip()  # standaard back-upmap (de instelling in de app gaat voor)
@@ -50,7 +50,7 @@ DEFAULT_EXTS = ('stl,3mf,obj,ply,glb,gltf,'  # met 3D-preview
                 'fcstd,gcode,gco,'  # preview uit een ingebedde afbeelding
                 'step,stp,iges,igs,f3d,scad,blend,fbx,dae,3ds,off,amf,x3d,dxf,dwg,skp,sldprt,sldasm,ipt,iam,catpart,bgcode')  # alleen indexeren
 DEFAULTS = dict(scan_interval='5', min_age='10', extensions=DEFAULT_EXTS, thumb_size='384',
-                auth_user='', auth_hash='', api_key='', big_mb='50', recent_days='7', thumb_source='embedded', thumb_delay='0', thumb_paused='0', backup_keep='7', backup_thumbs='0', backup_dir='', zip_support='1', spoolman_url='', slicer='bambustudio', link_secret='', session_secret='')
+                auth_user='', auth_hash='', api_key='', big_mb='50', recent_days='7', thumb_source='embedded', thumb_delay='0', thumb_paused='0', backup_keep='7', backup_thumbs='0', backup_dir='', bambuddy_url='', bambuddy_key='', folder_rules_migrated='0', zip_support='1', spoolman_url='', slicer='bambustudio', link_secret='', session_secret='')
 CFG, OKAUTH = dict(DEFAULTS), set()
 AUTH_ON, FAILS = [False], {}  # AUTH_ON: zijn er accounts (dan is inloggen verplicht)? FAILS: mislukte inlogpogingen per adres
 DUMMY_HASH = generate_password_hash('dummy-voor-gelijke-rekentijd')
@@ -102,6 +102,7 @@ def init():
                         'CREATE TABLE IF NOT EXISTS prints(id INTEGER PRIMARY KEY, model_id INTEGER REFERENCES models(id) ON DELETE CASCADE, ts REAL, result TEXT, printer_id INTEGER,'
                         ' printer TEXT, plate INTEGER, grams REAL, spool_id INTEGER, spool TEXT, notes TEXT);'
                         'CREATE INDEX IF NOT EXISTS idx_prints_model ON prints(model_id);'
+                        'CREATE TABLE IF NOT EXISTS bb_imported(bb_id INTEGER PRIMARY KEY);'
                         "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE, pw_hash TEXT, role TEXT DEFAULT 'viewer',"
                         ' can_download INTEGER DEFAULT 1, active INTEGER DEFAULT 1, ver INTEGER DEFAULT 0, created REAL, last_login REAL);')
         have = [r[1] for r in c.execute('PRAGMA table_info(models)')]
@@ -349,7 +350,7 @@ def config_on_network():
 scan_lock = threading.Lock()
 SCANP = dict(phase='', dirs=0, files=0, added=0, total=0)  # voortgang van de lopende scan (voor de balk in de webinterface)
 T = dict(scan=dict(last=None, dur=None, running=False), rebuild=dict(last=None), backup=dict(last=None, dur=None), thumbcheck=dict(last=None))
-NEXT, dirty, CUR, OBS = dict(scan=0, soon=0, backup=time.time() + 3600), {}, {}, {}
+NEXT, dirty, CUR, OBS = dict(scan=0, soon=0, backup=time.time() + 3600, bambuddy=time.time() + 90), {}, {}, {}
 STABLE = {}  # pad -> (grootte, sinds wanneer onveranderd): netwerk-kopieën behouden vaak een oude mtime
 
 
@@ -899,6 +900,13 @@ def scheduler():
             if NEXT['soon'] and now >= NEXT['soon']:
                 NEXT['soon'] = 0
                 scan()
+            if now >= NEXT.get('bambuddy', 0):
+                NEXT['bambuddy'] = now + 1800
+                if CFG['bambuddy_url'] and CFG['bambuddy_key']:
+                    try:
+                        bambuddy_sync()
+                    except ValueError as e:
+                        log.warning('Bambuddy synchroniseren mislukt: %s', e)
             if now >= NEXT['backup']:
                 NEXT['backup'] = now + 86400
                 backup()
@@ -1349,7 +1357,7 @@ def library():
     if viewer:  # gasten zien geen privé-gegevens: notities, logboek, bestandspaden op de schijf (op een kopie: de onthouden lijst blijft ongemoeid)
         models = [dict(m, path=(f"{m['container']}/{m['member']}" if m['container'] else posixpath.join(m['folder'].replace(os.sep, '/'), f"{m['name']}.{m['ext']}")),
                        notes='', error=None, can_rename=False, prints_ok=0, prints_failed=0, last_print=None, favorite=False, printed='', dup='') for m in models]
-    out = dict(categories=categories, big_mb=int(CFG['big_mb']), recent_days=int(CFG['recent_days']), spoolman=bool(CFG['spoolman_url']) and not viewer,
+    out = dict(categories=categories, big_mb=int(CFG['big_mb']), recent_days=int(CFG['recent_days']), spoolman=bool(CFG['spoolman_url']) and not viewer, bambuddy=bool(CFG['bambuddy_url'] and CFG['bambuddy_key']) and not viewer,
                local=is_local(), slicer=dict(zip(('name', 'scheme'), SLICERS.get(CFG['slicer'], SLICERS['bambustudio']))))
     if 'page' not in request.args:  # zonder paginaparameters: de hele lijst (API-gebruikers, tests)
         return jsonify(models=models, **out)
@@ -1782,7 +1790,7 @@ def assign():
 
 
 # ---------------------------------------------------------------- automatisch indelen: mappen en regels
-RULE_FIELDS = ('path', 'name', 'ext')
+RULE_FIELDS = ('path', 'name', 'ext', 'folder')  # folder: de map op het hoogste niveau is gelijk aan de tekst (ook submappen)
 
 
 def _model_keys(c, ids=None):
@@ -1802,9 +1810,10 @@ def _model_keys(c, ids=None):
             rel = os.path.relpath(r['container'] or r['path'], roots[r['root_id']]).replace(os.sep, '/')
         except (KeyError, ValueError):
             rel = (r['container'] or r['path']).replace(os.sep, '/')
+        top = rel.split('/')[0] if '/' in rel else ''  # hoogste map; bij een zip telt de map waarin de zip staat
         if r['container'] and r['member']:
             rel += '/' + r['member']
-        out[r['id']] = (rel.lower(), (r['name'] or '').lower(), (r['ext'] or '').lower())
+        out[r['id']] = (rel.lower(), (r['name'] or '').lower(), (r['ext'] or '').lower(), top.lower(), top)
     return out
 
 
@@ -1812,8 +1821,8 @@ def _rule_hits(rule, keys):
     v = (rule['value'] or '').strip().lower().lstrip('.') if rule['field'] == 'ext' else (rule['value'] or '').strip().lower()
     if not v:
         return []
-    i = {'path': 0, 'name': 1, 'ext': 2}[rule['field']]
-    return [mid for mid, k in keys.items() if (k[i] == v if rule['field'] == 'ext' else v in k[i])]
+    i = {'path': 0, 'name': 1, 'ext': 2, 'folder': 3}[rule['field']]
+    return [mid for mid, k in keys.items() if (k[i] == v if rule['field'] in ('ext', 'folder') else v in k[i])]
 
 
 def apply_rules(ids=None, rule_id=None):
@@ -1829,6 +1838,32 @@ def apply_rules(ids=None, rule_id=None):
                 n += c.execute('INSERT OR IGNORE INTO model_categories VALUES(?,?)', (mid, rl['category_id'])).rowcount
     if n:
         bump()
+    return n
+
+
+def migrate_folder_rules():
+    """Eenmalig: mappen die met "Categorieën uit mappen" waren ingedeeld (categorie met de mapnaam, minstens de helft van de modellen erin)
+    krijgen alsnog een regel, zodat nieuwe bestanden in die map dezelfde categorie krijgen. Er wordt niets aan bestaande modellen veranderd."""
+    if CFG.get('folder_rules_migrated') == '1':
+        return 0
+    n = 0
+    with db() as c:
+        keys = _model_keys(c)
+        cats = {r['name'].lower(): r['id'] for r in c.execute('SELECT id, name FROM categories')}
+        have = {(r['model_id'], r['category_id']) for r in c.execute('SELECT * FROM model_categories')}
+        by = {}
+        for mid, k in keys.items():
+            if k[3] and not k[3].startswith('.'):
+                by.setdefault(k[4], []).append(mid)
+        for f, ids in by.items():
+            cid = cats.get(f.lower())
+            if cid and sum((m, cid) in have for m in ids) * 2 >= len(ids) \
+                    and not c.execute('SELECT 1 FROM rules WHERE field=? AND value=? COLLATE NOCASE AND category_id=?', ('folder', f, cid)).fetchone():
+                c.execute('INSERT INTO rules(field,value,category_id,created) VALUES(?,?,?,?)', ('folder', f, cid, time.time()))
+                n += 1
+    put('folder_rules_migrated', '1')
+    if n:
+        log.info('%d map(pen) die al waren ingedeeld hebben nu een regel: nieuwe bestanden krijgen dezelfde categorie', n)
     return n
 
 
@@ -1883,6 +1918,8 @@ def folders_categorize():
                 cid = c.execute('INSERT INTO categories(name) VALUES(?)', (name,)).lastrowid
                 created += 1
             assigned += sum(c.execute('INSERT OR IGNORE INTO model_categories VALUES(?,?)', (mid, cid)).rowcount for mid in ids_by[f])
+            if not c.execute('SELECT 1 FROM rules WHERE field=? AND value=? COLLATE NOCASE AND category_id=?', ('folder', f, cid)).fetchone():
+                c.execute('INSERT INTO rules(field,value,category_id,created) VALUES(?,?,?,?)', ('folder', f, cid, time.time()))  # onthoud de map: nieuwe bestanden erin krijgen dezelfde categorie
     hist('Categorie', f'{assigned} modellen ingedeeld vanuit {len(items)} map(pen); {created} nieuwe categorie(ën)')
     return jsonify(created=created, assigned=assigned)
 
@@ -2192,6 +2229,272 @@ def printers_del(pid):
     return jsonify(ok=True)
 
 
+# ---------------------------------------------------------------- Bambuddy (versturen + printgeschiedenis)
+BB_EXTS = ('3mf', 'gcode', 'stl')
+T['bambuddy'] = dict(last=None, result=None, error=None)
+
+
+def bb_conn(timeout):
+    import http.client
+    base = CFG['bambuddy_url'].strip().rstrip('/')
+    if not base or not CFG['bambuddy_key']:
+        raise ValueError('Bambuddy is niet ingesteld (Instellingen → Algemeen)')
+    u = urllib.parse.urlsplit(base)
+    cls = http.client.HTTPSConnection if u.scheme == 'https' else http.client.HTTPConnection
+    return cls(u.hostname, u.port, timeout=timeout), (u.path or '') + '/api/v1', base
+
+
+def bb_reason(body):
+    """De leesbare reden uit een foutantwoord van Bambuddy (FastAPI: {"detail": ...}), anders het begin van de tekst."""
+    raw = body[:400].decode('utf-8', 'ignore')
+    try:
+        d = json.loads(body)
+        d = d.get('detail', d) if isinstance(d, dict) else d
+    except ValueError:
+        return raw
+    if isinstance(d, dict):
+        errs = d.get('errors')
+        if isinstance(errs, list) and errs:
+            return '; '.join(f"{e.get('filename') or ''}: {e.get('error') or e}".strip(': ') if isinstance(e, dict) else str(e) for e in errs)[:300]
+        return str(d.get('message') or raw)[:300]
+    if isinstance(d, list):
+        return '; '.join(str(x.get('msg', x)) if isinstance(x, dict) else str(x) for x in d)[:300]
+    return str(d)[:300]
+
+
+def bb_sliced(path, ext):
+    """Is dit een geslicede print (.gcode, of een 3MF met G-code erin)? Bambuddy zet in de wachtrij alleen geslicede bestanden."""
+    if ext in ('gcode', 'gco'):
+        return True
+    if ext == '3mf':
+        try:
+            with zipfile.ZipFile(path) as z:
+                return any(n.lower().endswith('.gcode') for n in z.namelist())
+        except (OSError, zipfile.BadZipFile):
+            return False
+    return False
+
+
+def bb_fail(r, body, base):
+    msg = bb_reason(body)
+    if r.status in (401, 403):
+        return ValueError(f'Bambuddy weigert de API-sleutel of de rechten daarvan ({r.status}). Controleer de sleutel onder Instellingen → API Keys in Bambuddy.')
+    return ValueError(f'Bambuddy antwoordde met fout {r.status}: {msg}')
+
+
+def bb_call(path, method='GET', params=None, body=None, timeout=15):
+    conn, pre, base = bb_conn(timeout)
+    q = ('?' + urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})) if params else ''
+    try:
+        conn.request(method, pre + path + q, body=json.dumps(body).encode() if body is not None else None,
+                     headers={'X-API-Key': CFG['bambuddy_key'], 'Accept': 'application/json', **({'Content-Type': 'application/json'} if body is not None else {})})
+        r = conn.getresponse()
+        data = r.read()
+    except (OSError, ValueError) as e:
+        raise ValueError(f'Bambuddy is niet bereikbaar op {base}: {getattr(e, "strerror", None) or e}')
+    finally:
+        conn.close()
+    if r.status >= 300:
+        raise bb_fail(r, data, base)
+    try:
+        return json.loads(data or b'null')
+    except ValueError:
+        raise ValueError('Bambuddy gaf een onverwacht antwoord (geen JSON). Klopt het adres?')
+
+
+def bb_upload(path, filename, timeout=600):
+    """Bestand als multipart naar de bibliotheek van Bambuddy streamen (zonder het in het geheugen te laden)."""
+    conn, pre, base = bb_conn(timeout)
+    boundary = secrets.token_hex(16)
+    safe = filename.replace('"', '_').replace('\r', '').replace('\n', '')
+    head = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{safe}"\r\nContent-Type: application/octet-stream\r\n\r\n').encode('utf-8')
+    tail = f'\r\n--{boundary}--\r\n'.encode()
+    try:
+        conn.putrequest('POST', pre + '/library/files')
+        conn.putheader('X-API-Key', CFG['bambuddy_key'])
+        conn.putheader('Accept', 'application/json')
+        conn.putheader('Content-Type', f'multipart/form-data; boundary={boundary}')
+        conn.putheader('Content-Length', str(len(head) + os.path.getsize(path) + len(tail)))
+        conn.endheaders()
+        conn.send(head)
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                conn.send(chunk)
+        conn.send(tail)
+        r = conn.getresponse()
+        data = r.read()
+    except (OSError, ValueError) as e:
+        raise ValueError(f'Versturen naar Bambuddy mislukt: {getattr(e, "strerror", None) or e}')
+    finally:
+        conn.close()
+    if r.status >= 300:
+        raise bb_fail(r, data, base)
+    return json.loads(data or b'{}')
+
+
+def bb_items(x, *keys):
+    """Lijst uit een antwoord halen: direct een lijst, of onder een van de sleutels."""
+    if isinstance(x, list):
+        return x
+    for k in keys:
+        if isinstance(x, dict) and isinstance(x.get(k), list):
+            return x[k]
+    return []
+
+
+@app.get('/api/bambuddy/status')
+def bambuddy_status():
+    if not (CFG['bambuddy_url'] and CFG['bambuddy_key']):
+        return jsonify(configured=False)
+    try:
+        ps = [dict(id=p.get('id'), name=str(p.get('name') or p.get('serial_number') or f"Printer {p.get('id')}")) for p in bb_items(bb_call('/printers/', timeout=5), 'items', 'printers') if isinstance(p, dict) and p.get('id') is not None]
+        return jsonify(configured=True, ok=True, printers=ps, sync=T['bambuddy'])
+    except ValueError as e:
+        return jsonify(configured=True, ok=False, error=str(e), sync=T['bambuddy'])
+
+
+@app.post('/api/models/<int:mid>/bambuddy')
+def bambuddy_send(mid):
+    """Model naar Bambuddy sturen: in de bibliotheek zetten of ook in de wachtrij. Nooit meteen printen: starten doe je in Bambuddy."""
+    r = one(mid)
+    j = request.json or {}
+    action = j.get('action')
+    if action not in ('library', 'queue'):
+        return jsonify(error='Onbekende actie'), 400
+    if r['ext'] not in BB_EXTS:
+        return jsonify(error=f'Bambuddy neemt alleen {", ".join("." + e for e in BB_EXTS)} aan'), 400
+    if r['size'] > MAX_MB * 2 ** 20:
+        return jsonify(error=f'Bestand groter dan {MAX_MB} MB (MAX_FILE_MB)'), 413
+    try:
+        pid = int(j['printer_id']) if action == 'queue' else None
+    except (KeyError, TypeError, ValueError):
+        return jsonify(error='Kies eerst een printer voor de wachtrij'), 400
+    name = (posixpath.basename(r['member']) if r['container'] else f"{r['name']}.{r['ext']}")
+    try:
+        with materialize(r) as src:
+            if action == 'queue' and not bb_sliced(src, r['ext']):  # vooraf: niets uploaden dat toch geweigerd wordt
+                return jsonify(error='Bambuddy zet alleen geslicede bestanden (.gcode of .gcode.3mf) in de wachtrij. Dit bestand is niet gesliced: slice het eerst in je slicer en stuur dan dat bestand. In de bibliotheek zetten kan wel.'), 400
+            up = bb_upload(src, name)
+        fid = up.get('id')
+        if fid is None:
+            raise ValueError('Bambuddy gaf geen bestands-id terug')
+        q = qstatus = None
+        if action == 'queue':
+            res = bb_call('/library/files/add-to-queue', 'POST', body=dict(file_ids=[fid], printer_id=pid), timeout=30)
+            if res.get('errors'):
+                raise ValueError('Bambuddy kon het niet in de wachtrij zetten: ' + str((res['errors'][0] or {}).get('error') or res['errors'][0]))
+            added = res.get('added') or []
+            if not added:  # niets aangemaakt en ook geen fout: nooit stilletjes "gelukt" melden
+                raise ValueError('Bambuddy heeft niets in de wachtrij gezet. Antwoord van Bambuddy: ' + json.dumps(res, ensure_ascii=False)[:200])
+            q = added[0].get('queue_item_id')
+            try:  # controleren dat het item echt in de wachtrij staat en wat de status is
+                item = bb_call(f'/queue/{q}', timeout=10)
+                qstatus = str(item.get('status') or '') or None
+            except ValueError as e:
+                raise ValueError(f'Bambuddy meldt dat het in de wachtrij staat (#{q}), maar het item is daar niet terug te vinden: {e}')
+    except ValueError as e:
+        return jsonify(error=str(e)), 502
+    except OSError as e:
+        return jsonify(error=f'Bestand lezen mislukt: {e.strerror or e}'), 500
+    hist('Bambuddy', f"{name} naar Bambuddy gestuurd ({'in de wachtrij' if action == 'queue' else 'in de bibliotheek'})", mid)
+    return jsonify(ok=True, file_id=fid, queue_item_id=q, queue_status=qstatus, duplicate=up.get('duplicate_of') is not None)
+
+
+def bb_norm(n):
+    n = str(n or '').strip().lower()
+    for ext in ('.gcode.3mf', '.3mf', '.gcode', '.stl'):
+        if n.endswith(ext):
+            n = n[:-len(ext)]
+    return re.sub(r'\s+', ' ', n).strip()
+
+
+def bb_ts(v):
+    if not v:
+        return None
+    try:
+        import datetime
+        d = datetime.datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+        return (d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)).timestamp()  # Bambuddy rekent in UTC
+    except ValueError:
+        return None
+
+
+BB_LOCK = threading.Lock()
+
+
+def bambuddy_sync():
+    """Printgeschiedenis uit Bambuddy overnemen in het printlogboek. Een regel wordt gekoppeld aan het model met dezelfde naam (alleen als dat
+    eenduidig is); wat niet past blijft in Bambuddy staan en wordt bij de volgende keer opnieuw geprobeerd. Elke regel komt maar één keer
+    binnen, ook als je hem hier later verwijdert."""
+    if not (CFG['bambuddy_url'] and CFG['bambuddy_key']):
+        raise ValueError('Bambuddy is niet ingesteld (Instellingen → Algemeen)')
+    if not BB_LOCK.acquire(blocking=False):
+        raise ValueError('Er loopt al een synchronisatie')
+    try:
+        items, off = [], 0
+        while off < 5000:
+            page = bb_call('/print-log/', params=dict(limit=100, offset=off), timeout=30)
+            got = bb_items(page, 'items')
+            items += got
+            off += 100
+            if len(got) < 100 or off >= int((page or {}).get('total') or 0):
+                break
+        with db() as c:
+            seen = {r[0] for r in c.execute('SELECT bb_id FROM bb_imported')}
+            idx = {}
+            for m in c.execute('SELECT id, name, display_name, ext FROM models'):
+                for n in {bb_norm(m['name']), bb_norm(m['display_name'])} - {''}:
+                    idx.setdefault(n, []).append((m['id'], m['ext']))
+        added, known, unmatched, other, statuses = 0, 0, [], 0, {}
+        new = []
+        for it in items:
+            bid = it.get('id')
+            if bid is None or bid in seen:
+                known += 1
+                continue
+            st = str(it.get('status') or '').lower()
+            statuses[st] = statuses.get(st, 0) + 1
+            res = 'ok' if any(k in st for k in ('complet', 'success', 'finish')) else 'failed' if any(k in st for k in ('fail', 'error')) else None
+            if res is None:  # bezig of afgebroken: pas meenemen als het een duidelijke uitkomst heeft
+                other += 1
+                continue
+            cand = idx.get(bb_norm(it.get('print_name')), [])
+            if len(cand) > 1:
+                cand = [x for x in cand if x[1] == '3mf']
+            if len(cand) != 1:
+                unmatched.append(str(it.get('print_name') or '?'))
+                continue
+            note = 'Bambuddy' + (f": {it['failure_reason']}" if res == 'failed' and it.get('failure_reason') else '')
+            new.append((bid, cand[0][0], bb_ts(it.get('completed_at')) or bb_ts(it.get('started_at')) or bb_ts(it.get('created_at')) or time.time(), res,
+                        it.get('printer_name'), it.get('filament_used_grams'), note[:1000]))
+        with db() as c:
+            for bid, mid, ts, res, pr, grams, note in new:
+                c.execute('INSERT OR IGNORE INTO bb_imported(bb_id) VALUES(?)', (bid,))
+                c.execute('INSERT INTO prints(model_id,ts,result,printer,grams,notes) VALUES(?,?,?,?,?,?)', (mid, ts, res, pr, grams, note))
+                if res == 'ok':
+                    c.execute("UPDATE models SET printed='printed' WHERE id=?", (mid,))
+                added += 1
+        if added:
+            hist('Bambuddy', f'{added} prints uit Bambuddy overgenomen in het printlogboek')
+        T['bambuddy'] = dict(last=time.time(), error=None,
+                             result=dict(added=added, known=known, unmatched=len(unmatched), other=other, examples=sorted(set(unmatched))[:8], statuses=statuses))
+        bump()
+        return T['bambuddy']
+    except ValueError as e:
+        T['bambuddy'] = dict(last=time.time(), error=str(e), result=None)
+        raise
+    finally:
+        BB_LOCK.release()
+
+
+@app.post('/api/bambuddy/sync')
+def bambuddy_sync_now():
+    try:
+        return jsonify(bambuddy_sync())
+    except ValueError as e:
+        return jsonify(error=str(e)), 502
+
+
 # ---------------------------------------------------------------- Spoolman + printlogboek
 def spoolman_call(path, method='GET', body=None, timeout=5):
     base = CFG['spoolman_url'].rstrip('/')
@@ -2309,7 +2612,7 @@ def fs():
 @app.get('/api/settings')
 def settings_get():
     return jsonify(scan_interval=int(CFG['scan_interval']), min_age=int(CFG['min_age']), extensions=CFG['extensions'],
-                   thumb_size=int(CFG['thumb_size']), big_mb=int(CFG['big_mb']), recent_days=int(CFG['recent_days']), thumb_source=CFG['thumb_source'], thumb_delay=int(CFG['thumb_delay']), spoolman_url=CFG['spoolman_url'], slicer=CFG['slicer'], backup_keep=int(CFG['backup_keep']), backup_thumbs=CFG['backup_thumbs'] == '1', backup_dir=CFG['backup_dir'], backup_dir_now=backup_dir(), backup_last=T['backup']['last'], backup_error=T['backup'].get('error'), zip_support=CFG['zip_support'] == '1', api_key=CFG['api_key'],
+                   thumb_size=int(CFG['thumb_size']), big_mb=int(CFG['big_mb']), recent_days=int(CFG['recent_days']), thumb_source=CFG['thumb_source'], thumb_delay=int(CFG['thumb_delay']), spoolman_url=CFG['spoolman_url'], slicer=CFG['slicer'], backup_keep=int(CFG['backup_keep']), backup_thumbs=CFG['backup_thumbs'] == '1', backup_dir=CFG['backup_dir'], backup_dir_now=backup_dir(), bambuddy_url=CFG['bambuddy_url'], bambuddy_key_set=bool(CFG['bambuddy_key']), backup_last=T['backup']['last'], backup_error=T['backup'].get('error'), zip_support=CFG['zip_support'] == '1', api_key=CFG['api_key'],
                    host=HOST, port=PORT, version=VERSION)
 
 
@@ -2331,6 +2634,15 @@ def settings_post():
         if u and not u.lower().startswith(('http://', 'https://')):
             return jsonify(error='Het adres van Spoolman moet met http:// of https:// beginnen'), 400
         put('spoolman_url', u)
+    if 'bambuddy_url' in j:
+        u = (j['bambuddy_url'] or '').strip().rstrip('/')
+        if u and not u.lower().startswith(('http://', 'https://')):
+            return jsonify(error='Het adres van Bambuddy moet met http:// of https:// beginnen'), 400
+        put('bambuddy_url', u)
+    if j.get('bambuddy_key_clear'):
+        put('bambuddy_key', '')
+    elif str(j.get('bambuddy_key') or '').strip():  # leeg laten = de opgeslagen sleutel behouden
+        put('bambuddy_key', str(j['bambuddy_key']).strip())
     if 'backup_thumbs' in j:
         put('backup_thumbs', '1' if j['backup_thumbs'] else '0')
     if 'backup_dir' in j:
@@ -2490,6 +2802,10 @@ def status():
 def main():
     t_start = time.time()
     init()
+    try:
+        migrate_folder_rules()
+    except Exception as e:  # een extra: mag het opstarten nooit stoppen
+        log.warning('Mapregels aanmaken mislukt: %s', e)
     log.info('Database gereed (%.1fs)', time.time() - t_start)
     shutil.rmtree(os.path.join(CONFIG, 'tmp'), ignore_errors=True)
     shutil.rmtree(os.path.join(CONFIG, 'open'), ignore_errors=True)

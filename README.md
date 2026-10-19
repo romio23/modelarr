@@ -1,8 +1,10 @@
 # Modelarr (server-versie)
 
+> Deze app is gemaakt met behulp van [Claude](https://claude.ai) (Anthropic).
+
 > English documentation: [README-EN.md](README-EN.md)
 
-Modelarr beheert je 3D-modellen zoals Sonarr en Radarr je films en series beheren. Modelarr is gemaakt met behulp van Claude.
+Modelarr beheert je 3D-modellen zoals Sonarr en Radarr je films en series beheren.
 
 Beheer je 3D-modellen zoals Sonarr/Radarr je films beheert: root folders, live bestandswachter,
 automatische thumbnails, categorieën, wachtrij/geschiedenis, taken, logs en statuspagina.
@@ -258,6 +260,15 @@ Database en thumbnails blijven bewaard. Je bestaande `/etc/modelarr.env` wordt n
 Overige instellingen (scaninterval, extensies, thumbnailgrootte, extra root folders, authenticatie,
 API-sleutel) staan in de app onder **Instellingen**.
 
+## Bambuddy-koppeling
+Heb je [Bambuddy](https://github.com/maziggy/bambuddy) (zelf gehoste printbeheer voor Bambu Lab-printers)? Dan kun je het op twee manieren koppelen. Het is optioneel en staat uit zolang het adres of de sleutel leeg is.
+1. Maak in Bambuddy onder **Instellingen → API Keys** een sleutel (je ziet hem maar één keer).
+2. Vul in Modelarr onder **Instellingen → Algemeen → Bambuddy** het adres (bijv. `http://192.168.1.20:8000`) en de sleutel in. Klik op **Opslaan** en dan op **Verbinding testen**.
+- **Model versturen:** open een `.3mf`-, `.gcode`- of `.stl`-model en klik op **↗ Naar Bambuddy…**. Kies **In bibliotheek zetten** of kies een printer en **In wachtrij zetten**. Er wordt nooit iets gestart: starten doe je zelf in Bambuddy. Alleen beheerders zien deze knop. **De wachtrij van Bambuddy neemt alleen geslicede bestanden aan** (`.gcode` of een 3MF met G-code erin, dus uit je slicer geëxporteerd als "gesliced"). Een STL of een niet-geslicede 3MF kun je wel in de bibliotheek zetten, maar niet in de wachtrij; Modelarr meldt dat vooraf.
+- **Printgeschiedenis:** elke 30 minuten (of met **Nu synchroniseren**) wordt het printlogboek van Bambuddy overgenomen in het printlogboek van Modelarr. Een regel wordt gekoppeld aan het model met dezelfde naam, alleen als dat eenduidig is (bij twee modellen met dezelfde naam wordt de `.3mf` gekozen; blijven er dan nog meer over, dan wordt hij overgeslagen). Gelukt en mislukt komen binnen, met printer, gewicht, tijd en eventuele reden. Prints die nog bezig zijn of zijn afgebroken, en regels zonder bijpassend model, worden niet overgenomen; bij een volgende keer wordt het opnieuw geprobeerd. Een regel komt maar één keer binnen, ook als je hem in Modelarr later verwijdert.
+- **Verbruik en Spoolman:** Bambuddy houdt zelf het filamentverbruik bij. Haal je prints binnen via de synchronisatie, laat Modelarr dan **geen** verbruik meer van een spoel aftrekken, anders trek je het twee keer af.
+- **Sleutel:** de API-sleutel wordt in de database van Modelarr opgeslagen (net als de eigen API-sleutel) en nooit teruggestuurd naar de browser. Met **Sleutel wissen** zet je de koppeling uit.
+
 ## Hoe nieuwe bestanden worden opgenomen
 - Live bestandswachter (inotify) op elke root folder op een lokale schijf, met 3 sec debounce. Op netwerkshares (NFS/SMB/CIFS)
   wordt de wachter niet gebruikt: die levert toch geen events voor wijzigingen van andere computers, en het opzetten ervan
@@ -297,7 +308,7 @@ Selecteer modellen in de bibliotheek (vinkjes, Shift+klik voor een bereik, of "A
 
 **Instellingen → Automatisch indelen** (ook bereikbaar via een link op de pagina Categorieën):
 
-- **Categorieën uit mappen.** Elke map op het hoogste niveau van je root folders kan een categorie worden. Je ziet per map het aantal modellen en of ze al zijn ingedeeld. Vink de mappen aan die je wilt (of kies "Alles kiezen" / "Alleen nog niet ingedeelde"), pas zo nodig de categorienaam aan (een bestaande categorie mag ook) en kies **Toepassen**. Alle modellen in die map, ook in submappen, komen in de categorie. Dit haalt nooit iets weg en kan veilig opnieuw. Modellen die direct in een root folder staan hebben geen map en doen niet mee.
+- **Categorieën uit mappen.** Elke map op het hoogste niveau van je root folders kan een categorie worden. Je ziet per map het aantal modellen en of ze al zijn ingedeeld. Vink de mappen aan die je wilt (of kies "Alles kiezen" / "Alleen nog niet ingedeelde"), pas zo nodig de categorienaam aan (een bestaande categorie mag ook) en kies **Toepassen**. Alle modellen in die map, ook in submappen, komen in de categorie. Dit haalt nooit iets weg en kan veilig opnieuw. Modellen die direct in een root folder staan hebben geen map en doen niet mee. Dit onthoudt de map: er komt een regel "map is …" bij, zodat **nieuwe bestanden in die map (ook in submappen) bij de volgende scan dezelfde categorie krijgen**. Mappen die je met een eerdere versie al had ingedeeld (met een categorie met dezelfde naam als de map) krijgen die regel bij de update vanzelf; bij een andere categorienaam deel je de map nog één keer opnieuw in. Verwijder je de regel onder Regels, dan stopt het automatisch indelen voor die map.
 - **Regels.** "Pad bevat", "naam bevat" of "extensie is" een tekst, dan hoort het model in een categorie. Nieuwe bestanden krijgen de categorie automatisch bij de scan. Met **Alle regels nu toepassen** gaan ook de bestaande modellen mee. Bij elke regel zie je hoeveel modellen erbij passen en hoeveel nog niet zijn ingedeeld. Het pad telt vanaf de root folder met / tussen de mappen, bijvoorbeeld `10 inch rack/`. Een regel haalt nooit een categorie weg.
 
 **Sneller selecteren in de bibliotheek** (voor beheerders):
@@ -550,7 +561,6 @@ Zoeken, filteren, sorteren en pagineren gebeurt op de server: de browser krijgt 
 - **LXC** (`/opt/modelarr`, met `venv`): werkt de Python-pakketten bij (`pip install -U`) en herstart de service. Draai het script daar vanuit `/opt/modelarr`. Het besturingssysteem werk je bij met `apt-get update && apt-get -y upgrade`. `sh install-lxc.sh` opnieuw draaien kan ook en is veilig.
 
 De meldingen "Running pip as the 'root' user" en "A new release of pip is available" tijdens het bouwen zijn alleen mededelingen, geen fouten. In deze versie zijn ze uitgezet.
-
 
 ## Licentie
 MIT, zie [LICENSE](LICENSE).

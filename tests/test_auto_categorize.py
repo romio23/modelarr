@@ -34,7 +34,7 @@ check('foute invoer geeft een melding', c.post('/api/folders/categorize', json={
 # regels
 tid = ct['Tools']
 rid = c.post('/api/rules', json={'field': 'name', 'value': 'RACK', 'category_id': ct['10 inch rack']}, headers=H).get_json()['id']
-rl = c.get('/api/rules').get_json()
+rl = [x for x in c.get('/api/rules').get_json() if x['field'] == 'name']  # de mapregels (uit "Categorieën uit mappen") staan er ook in
 check('regel: naam bevat "rack" (hoofdletterongevoelig) vindt Rack_houder; 1 nog te doen', rl[0]['matches'] == 1 and rl[0]['todo'] == 1 and rl[0]['category'] == '10 inch rack', rl)
 check('dezelfde regel nog eens: bestaande wordt teruggegeven', c.post('/api/rules', json={'field': 'name', 'value': 'rack', 'category_id': ct['10 inch rack']}, headers=H).get_json().get('existing') is True)
 check('ongeldige regels worden geweigerd', all(c.post('/api/rules', json=b, headers=H).status_code == 400 for b in ({'field': 'x', 'value': 'a', 'category_id': tid}, {'field': 'path', 'value': ' ', 'category_id': tid}, {'field': 'path', 'value': 'a', 'category_id': 9999})))

@@ -1,6 +1,25 @@
 // Engelse vertaling (gegenereerd). Sleutel = Nederlandse tekst. exact: hele tekst; phrases: zinsdelen binnen een langere tekst; patterns: [regex, vlaggen, vervanging].
 window.I18N_EN = {
 "exact": {
+"Plak hier de sleutel uit Bambuddy": "Paste the key from Bambuddy here",
+"•••••••• (opgeslagen, leeg laten om te behouden)": "•••••••• (saved, leave empty to keep)",
+"Optioneel. Maak in Bambuddy onder Instellingen → API Keys een sleutel. Daarmee kun je een model naar Bambuddy sturen (bibliotheek of wachtrij) en wordt de printgeschiedenis van Bambuddy elke 30 minuten overgenomen in het printlogboek. De sleutel wordt in de database van deze app opgeslagen en nooit teruggestuurd naar de browser.": "Optional. In Bambuddy, create a key under Settings → API Keys. With it you can send a model to Bambuddy (library or queue), and Bambuddy's print history is imported into the print log every 30 minutes. The key is stored in this app's database and is never sent back to the browser.",
+"Printer (voor de wachtrij)": "Printer (for the queue)",
+"In bibliotheek zetten": "Put in library",
+"In wachtrij zetten": "Add to queue",
+"Er wordt niets gestart. Starten doe je zelf in Bambuddy.": "Nothing is started. You start it yourself in Bambuddy.",
+"Niet beschikbaar": "Not available",
+"Kies een printer…": "Choose a printer…",
+"Adres van Bambuddy": "Bambuddy address",
+"API-sleutel van Bambuddy": "Bambuddy API key",
+"Nu synchroniseren": "Sync now",
+"Sleutel wissen": "Clear key",
+"Het model naar Bambuddy sturen": "Send the model to Bambuddy",
+"Alleen in de bibliotheek van Bambuddy zetten": "Only put it in Bambuddy's library",
+"In de wachtrij van Bambuddy zetten; starten doe je daar zelf": "Add to Bambuddy's queue; you start it there yourself",
+"Onbekende actie": "Unknown action",
+"Kies eerst een printer voor de wachtrij": "Choose a printer for the queue first",
+"Het adres van Bambuddy moet met http:// of https:// beginnen": "The Bambuddy address must start with http:// or https://",
 "Back-upmap": "Backup folder",
 "Kiezen…": "Choose…",
 "Nu back-uppen": "Back up now",
@@ -49,6 +68,7 @@ window.I18N_EN = {
 "pad bevat": "path contains",
 "naam bevat": "name contains",
 "extensie is": "extension is",
+"map is": "folder is",
 "(eerst een categorie aanmaken)": "(create a category first)",
 "tekst, bijv. rack": "text, e.g. rack",
 "→ categorie": "→ category",
@@ -503,6 +523,154 @@ window.I18N_EN = {
 },
 "phrases": [
 [
+"Bambuddy zet alleen geslicede bestanden (.gcode of .gcode.3mf) in de wachtrij. Dit bestand is niet gesliced: slice het eerst in je slicer en stuur dan dat bestand. In de bibliotheek zetten kan wel.",
+"Bambuddy only queues sliced files (.gcode or .gcode.3mf). This file is not sliced: slice it in your slicer first and then send that file. Putting it in the library is possible."
+],
+[
+" De wachtrij van Bambuddy neemt alleen geslicede bestanden (.gcode of .gcode.3mf) aan.",
+" Bambuddy's queue only accepts sliced files (.gcode or .gcode.3mf)."
+],
+[
+"Bambuddy heeft niets in de wachtrij gezet. Antwoord van Bambuddy:",
+"Bambuddy did not add anything to the queue. Bambuddy's response:"
+],
+[
+"Bambuddy meldt dat het in de wachtrij staat (",
+"Bambuddy says it is in the queue ("
+],
+[
+"), maar het item is daar niet terug te vinden:",
+"), but the item cannot be found there:"
+],
+[
+"Bambuddy weigert de API-sleutel of de rechten daarvan (",
+"Bambuddy rejects the API key or its permissions ("
+],
+[
+"). Controleer de sleutel onder Instellingen → API Keys in Bambuddy.",
+"). Check the key under Settings → API Keys in Bambuddy."
+],
+[
+"Bambuddy antwoordde met fout ",
+"Bambuddy responded with error "
+],
+[
+"Bambuddy is niet bereikbaar op ",
+"Bambuddy is not reachable at "
+],
+[
+"Bambuddy is niet ingesteld (Instellingen → Algemeen)",
+"Bambuddy is not set up (Settings → General)"
+],
+[
+"Bambuddy gaf een onverwacht antwoord (geen JSON). Klopt het adres?",
+"Bambuddy gave an unexpected response (not JSON). Is the address correct?"
+],
+[
+"Versturen naar Bambuddy mislukt: ",
+"Sending to Bambuddy failed: "
+],
+[
+"Bambuddy gaf geen bestands-id terug",
+"Bambuddy returned no file id"
+],
+[
+"Bambuddy kon het niet in de wachtrij zetten: ",
+"Bambuddy could not add it to the queue: "
+],
+[
+"Er loopt al een synchronisatie",
+"A sync is already running"
+],
+[
+"Laatste synchronisatie mislukt:",
+"Last sync failed:"
+],
+[
+"Laatste synchronisatie:",
+"Last sync:"
+],
+[
+" nieuw, ",
+" new, "
+],
+[
+" al bekend, ",
+" already known, "
+],
+[
+" zonder bijpassend model",
+" without a matching model"
+],
+[
+" nieuwe prints overgenomen",
+" new prints imported"
+],
+[
+"In de wachtrij van Bambuddy gezet (",
+"Added to Bambuddy's queue ("
+],
+[
+"Verstuurd (Bambuddy had dit bestand al)",
+"Sent (Bambuddy already had this file)"
+],
+[
+"In de bibliotheek van Bambuddy gezet",
+"Put in Bambuddy's library"
+],
+[
+" naar Bambuddy sturen en in de wachtrij van de gekozen printer zetten?",
+" to Bambuddy and add it to the queue of the chosen printer?"
+],
+[
+" naar de bibliotheek van Bambuddy sturen?",
+" to Bambuddy's library?"
+],
+[
+"Er wordt niets gestart.",
+"Nothing is started."
+],
+[
+"Kies eerst een printer",
+"Choose a printer first"
+],
+[
+"Verbonden met Bambuddy:",
+"Connected to Bambuddy:"
+],
+[
+"Vul eerst adres en sleutel in en klik op Opslaan",
+"Enter the address and key first, then click Save"
+],
+[
+"Bambuddy opgeslagen",
+"Bambuddy saved"
+],
+[
+"Sleutel gewist",
+"Key cleared"
+],
+[
+"De opgeslagen Bambuddy-sleutel wissen? De koppeling staat dan uit.",
+"Clear the stored Bambuddy key? The integration will then be off."
+],
+[
+" naar Bambuddy gestuurd (",
+" sent to Bambuddy ("
+],
+[
+"in de wachtrij)",
+"in the queue)"
+],
+[
+"in de bibliotheek)",
+"in the library)"
+],
+[
+" prints uit Bambuddy overgenomen in het printlogboek",
+" prints imported from Bambuddy into the print log"
+],
+[
 "Back-upmap bestaat niet (is de share of schijf gekoppeld?):",
 "Backup folder does not exist (is the share or disk mounted?):"
 ],
@@ -916,6 +1084,11 @@ window.I18N_EN = {
 ]
 ],
 "patterns": [
+[
+"^Bambuddy neemt alleen (.*) aan$",
+"",
+"Bambuddy only accepts $1"
+],
 [
 "^([\\d.,]+–[\\d.,]+) van ([\\d.,]+)$",
 "",

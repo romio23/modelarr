@@ -1,8 +1,10 @@
 # Modelarr (server version)
 
+> This app was built with the help of [Claude](https://claude.ai) (Anthropic).
+
 > This is the English version of the documentation. The Dutch original is [README.md](README.md); if the two ever differ, the Dutch one is leading. The app itself can be switched to English with the **EN** button at the bottom left of the navigation.
 
-Modelarr manages your 3D models the way Sonarr and Radarr manage your movies and series. Modelarr is created with the help from Claude.
+Modelarr manages your 3D models the way Sonarr and Radarr manage your movies and series.
 
 Root folders, a live file watcher, automatic thumbnails, categories, queue/history, tasks, logs and a status page.
 
@@ -257,6 +259,15 @@ The database and thumbnails are kept. Your existing `/etc/modelarr.env` is not o
 Other settings (scan interval, extensions, thumbnail size, extra root folders, authentication,
 API key) are in the app under **Settings**.
 
+## Bambuddy integration
+If you use [Bambuddy](https://github.com/maziggy/bambuddy) (self-hosted print management for Bambu Lab printers) you can connect it in two ways. It is optional and stays off while the address or key is empty.
+1. In Bambuddy, create a key under **Settings → API Keys** (it is shown only once).
+2. In Modelarr, enter the address (for example `http://192.168.1.20:8000`) and the key under **Settings → General → Bambuddy**. Click **Save** and then **Test connection**.
+- **Sending a model:** open a `.3mf`, `.gcode` or `.stl` model and click **↗ Send to Bambuddy…**. Choose **Put in library**, or pick a printer and choose **Add to queue**. Nothing is ever started: you start it yourself in Bambuddy. Only administrators see this button. **Bambuddy's queue only accepts sliced files** (`.gcode` or a 3MF with G-code inside, i.e. exported as "sliced" from your slicer). An STL or an unsliced 3MF can be put in the library but not in the queue; Modelarr tells you this beforehand.
+- **Print history:** every 30 minutes (or with **Sync now**) Bambuddy's print log is imported into Modelarr's print log. An entry is linked to the model with the same name, only if that is unambiguous (with two models of the same name the `.3mf` is chosen; if more remain it is skipped). Successful and failed prints are imported, with printer, weight, time and the reason if any. Prints that are still running or were cancelled, and entries without a matching model, are not imported; they are tried again next time. An entry is imported only once, even if you delete it in Modelarr later.
+- **Filament use and Spoolman:** Bambuddy tracks filament use itself. If you import prints through the sync, do **not** also let Modelarr deduct use from a spool, or it is deducted twice.
+- **Key:** the API key is stored in Modelarr's database (like its own API key) and is never sent back to the browser. **Clear key** turns the integration off.
+
 ## How new files are picked up
 - Live file watcher (inotify) on every root folder on a local disk, with a 3 second debounce. On network shares (NFS/SMB/CIFS)
   the watcher is not used: it gets no events for changes from other computers anyway, and setting it up over a large share
@@ -296,7 +307,7 @@ Select models in the library (checkboxes, Shift+click for a range, or "Select al
 
 **Settings → Auto-organize** (also reachable via a link on the Categories page):
 
-- **Categories from folders.** Every top-level folder of your root folders can become a category. You see per folder the number of models and whether they are already filed. Tick the folders you want (or choose "Select all" / "Only those not filed yet"), change the category name if needed (an existing category is fine too) and choose **Apply**. All models in that folder, including in subfolders, go in the category. This never removes anything and can safely be repeated. Models that are directly in a root folder have no folder and do not take part.
+- **Categories from folders.** Every top-level folder of your root folders can become a category. You see per folder the number of models and whether they are already filed. Tick the folders you want (or choose "Select all" / "Only those not filed yet"), change the category name if needed (an existing category is fine too) and choose **Apply**. All models in that folder, including in subfolders, go in the category. This never removes anything and can safely be repeated. Models that are directly in a root folder have no folder and do not take part. This remembers the folder: a rule "folder is …" is added, so **new files in that folder (including subfolders) get the same category at the next scan**. Folders you had already filed with an earlier version (with a category named like the folder) get that rule automatically on update; with a different category name, file the folder once more. If you delete the rule under Rules, automatic filing stops for that folder.
 - **Rules.** "Path contains", "name contains" or "extension is" a text, then the model belongs in a category. New files get the category automatically during the scan. With **Apply all rules to existing models now** the existing models are included too. For every rule you see how many models match and how many are not yet filed. The path counts from the root folder with / between folders, for example `10 inch rack/`. A rule never removes a category.
 
 **Selecting faster in the library** (for administrators):
