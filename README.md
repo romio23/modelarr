@@ -551,15 +551,6 @@ Zoeken, filteren, sorteren en pagineren gebeurt op de server: de browser krijgt 
 
 De meldingen "Running pip as the 'root' user" en "A new release of pip is available" tijdens het bouwen zijn alleen mededelingen, geen fouten. In deze versie zijn ze uitgezet.
 
-## Van "Modelbibliotheek" naar Modelarr
-
-De technische naam is nu overal `modelarr` (containernaam, systemd-service, logbestand `config/modelarr.log`, zipbestand). Je gegevens veranderen niet:
-
-- **Docker:** je eigen `docker-compose.yml` wordt niet overschreven, dus er breekt niets als je de oude naam laat staan. Wil je de nieuwe naam: zet bij `services:` en `container_name:` `modelarr` en draai `docker compose up -d --remove-orphans`. De `config`-map blijft dezelfde.
-- **LXC/systemd:** draai `sh install-lxc.sh` opnieuw. Het script zet de oude installatie, database, thumbnails en instellingen (`/var/lib/modelbibliotheek`, `/etc/modelbibliotheek.env`) over naar de nieuwe namen en vervangt de oude service.
-- **Windows:** niets te doen. Het oude logbestand `modelbibliotheek.log` mag je verwijderen.
-- Interne kenmerken (zoals het tekstkenmerk `modelbib` in de thumbnail-PNG's en de vaste aanvraagkop) heten nog zo. Hernoemen zou alle bestaande thumbnails ongeldig maken, dus dat is bewust niet gedaan.
-
 
 ## Licentie
 MIT, zie [LICENSE](LICENSE).
