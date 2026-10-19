@@ -549,14 +549,5 @@ Searching, filtering, sorting and paging happen on the server: the browser only 
 
 The messages "Running pip as the 'root' user" and "A new release of pip is available" during the build are only notices, not errors. In this version they are turned off.
 
-## From "Modelbibliotheek" to Modelarr
-
-The technical name is now `modelarr` everywhere (container name, systemd service, log file `config/modelarr.log`, zip file). Your data does not change:
-
-- **Docker:** your own `docker-compose.yml` is not overwritten, so nothing breaks if you leave the old name. If you want the new name: set `modelarr` at `services:` and `container_name:` and run `docker compose up -d --remove-orphans`. The `config` folder stays the same.
-- **LXC/systemd:** run `sh install-lxc.sh` again. The script moves the old installation, database, thumbnails and settings (`/var/lib/modelbibliotheek`, `/etc/modelbibliotheek.env`) over to the new names and replaces the old service.
-- **Windows:** nothing to do. You may delete the old log file `modelbibliotheek.log`.
-- Internal markers (such as the text marker `modelbib` in the thumbnail PNGs and the fixed request header) still have that name. Renaming them would invalidate all existing thumbnails, so that was deliberately not done.
-
 ## License
 MIT, see [LICENSE](LICENSE).
