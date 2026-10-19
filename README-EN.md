@@ -2,7 +2,7 @@
 
 > This is the English version of the documentation. The Dutch original is [README.md](README.md); if the two ever differ, the Dutch one is leading. The app itself can be switched to English with the **EN** button at the bottom left of the navigation.
 
-Modelarr manages your 3D models the way Sonarr and Radarr manage your movies and series.
+Modelarr manages your 3D models the way Sonarr and Radarr manage your movies and series. Modelarr is created with the help from Claude.
 
 Root folders, a live file watcher, automatic thumbnails, categories, queue/history, tasks, logs and a status page.
 
