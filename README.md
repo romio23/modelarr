@@ -2,7 +2,7 @@
 
 > English documentation: [README-EN.md](README-EN.md)
 
-Modelarr beheert je 3D-modellen zoals Sonarr en Radarr je films en series beheren.
+Modelarr beheert je 3D-modellen zoals Sonarr en Radarr je films en series beheren. Modelarr is gemaakt met behulp van Claude.
 
 Beheer je 3D-modellen zoals Sonarr/Radarr je films beheert: root folders, live bestandswachter,
 automatische thumbnails, categorieën, wachtrij/geschiedenis, taken, logs en statuspagina.
