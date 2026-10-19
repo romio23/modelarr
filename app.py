@@ -1,0 +1,2527 @@
+"""Modelarr - beheer je 3D-modellen zoals Sonarr/Radarr je films beheert.
+Config: omgevingsvariabelen (CONFIG_DIR, MODELS_DIR, HOST, PORT, AUTH_USER, AUTH_PASS, MAX_FILE_MB)
+en de Instellingen-pagina's in de app."""
+import base64, unicodedata, contextlib, io, json, logging.handlers, ntpath, os, posixpath, re, sys, time, hmac, hashlib, platform, secrets, sqlite3, threading, logging, shutil, collections, socket, subprocess, tempfile, urllib.error, urllib.parse, urllib.request, zipfile
+from xml.etree import ElementTree
+from datetime import timedelta
+from flask import Flask, request, jsonify, send_file, send_from_directory, abort, Response, g, session
+from werkzeug.security import generate_password_hash, check_password_hash
+import render
+from PIL import Image
+
+VERSION = '1.1.1'
+BASE = os.path.dirname(os.path.abspath(__file__))
+CONFIG = os.path.abspath(os.environ.get('CONFIG_DIR', os.path.join(BASE, 'config')))
+BACKUP_ENV = os.environ.get('BACKUP_DIR', '').strip()  # standaard back-upmap (de instelling in de app gaat voor)
+THUMBS, DB = os.path.join(CONFIG, 'thumbs'), os.path.join(CONFIG, 'library.db')
+HOST, PORT = os.environ.get('HOST', '0.0.0.0'), int(os.environ.get('PORT', 8765))
+MAX_MB = int(os.environ.get('MAX_FILE_MB', 400))
+FOLLOW_LINKS = os.environ.get('FOLLOW_SYMLINKS', '1' if os.name == 'nt' else '0') == '1'  # Windows/netwerkshares: mappen kunnen als link worden gemeld; op Linux standaard uit
+START, REV = time.time(), 0
+os.makedirs(THUMBS, exist_ok=True)
+app = Flask(__name__, static_folder=os.path.join(BASE, 'static'), static_url_path='/static')
+app.config['MAX_CONTENT_LENGTH'] = 25 * 2 ** 20
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', PERMANENT_SESSION_LIFETIME=timedelta(days=30))
+
+# ---------------------------------------------------------------- logging (ringbuffer voor Systeem > Logs)
+LOGS = collections.deque(maxlen=2000)
+
+
+class Ring(logging.Handler):
+    def emit(self, r):
+        LOGS.append(dict(t=r.created, level=r.levelname, msg=self.format(r)))
+
+
+log = logging.getLogger('modelbib')
+log.setLevel(logging.INFO)
+_r, _fmt = Ring(), logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+log.addHandler(_r)
+_fh = logging.handlers.RotatingFileHandler(os.path.join(CONFIG, 'modelarr.log'), maxBytes=1_000_000, backupCount=3, encoding='utf-8')
+_fh.setFormatter(_fmt)
+log.addHandler(_fh)
+if sys.stderr is not None:  # ontbreekt bij pythonw.exe (Windows zonder console)
+    _s = logging.StreamHandler()
+    _s.setFormatter(_fmt)
+    log.addHandler(_s)
+
+# ---------------------------------------------------------------- database & instellingen
+OLD_EXTS = 'stl,3mf,obj,ply,glb,gltf'
+DEFAULT_EXTS = ('stl,3mf,obj,ply,glb,gltf,'  # met 3D-preview
+                'fcstd,gcode,gco,'  # preview uit een ingebedde afbeelding
+                'step,stp,iges,igs,f3d,scad,blend,fbx,dae,3ds,off,amf,x3d,dxf,dwg,skp,sldprt,sldasm,ipt,iam,catpart,bgcode')  # alleen indexeren
+DEFAULTS = dict(scan_interval='5', min_age='10', extensions=DEFAULT_EXTS, thumb_size='384',
+                auth_user='', auth_hash='', api_key='', big_mb='50', recent_days='7', thumb_source='embedded', thumb_delay='0', thumb_paused='0', backup_keep='7', backup_thumbs='0', backup_dir='', zip_support='1', spoolman_url='', slicer='bambustudio', link_secret='', session_secret='')
+CFG, OKAUTH = dict(DEFAULTS), set()
+AUTH_ON, FAILS = [False], {}  # AUTH_ON: zijn er accounts (dan is inloggen verplicht)? FAILS: mislukte inlogpogingen per adres
+DUMMY_HASH = generate_password_hash('dummy-voor-gelijke-rekentijd')
+
+
+DBW = 0  # telt het aantal schrijfacties in de database (om de bibliotheeklijst te cachen)
+
+
+@contextlib.contextmanager
+def db():
+    """Eigen verbinding per gebruik (ook in achtergrond-threads): commit bij succes, rollback bij fout, altijd sluiten."""
+    global DBW
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute('PRAGMA foreign_keys=ON')
+    n0 = c.total_changes
+    try:
+        with c:
+            yield c
+    finally:
+        if c.total_changes != n0:
+            DBW += 1  # er is iets gewijzigd: de bibliotheeklijst in het geheugen is niet meer actueel
+        c.close()
+
+
+def init():
+    with db() as c:
+        c.execute('PRAGMA journal_mode=WAL')
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS roots(id INTEGER PRIMARY KEY, path TEXT UNIQUE, watch INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS models(id INTEGER PRIMARY KEY, root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE,
+            path TEXT UNIQUE, name TEXT, display_name TEXT, ext TEXT, size INTEGER, mtime REAL, added_at REAL,
+            thumb_status TEXT DEFAULT 'pending', thumb_error TEXT, thumb_at REAL, dx REAL, dy REAL, dz REAL, tris INTEGER);
+        CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE);
+        CREATE TABLE IF NOT EXISTS model_categories(
+            model_id INTEGER REFERENCES models(id) ON DELETE CASCADE,
+            category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE, PRIMARY KEY(model_id, category_id));
+        CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, ts REAL, event TEXT, model_id INTEGER, message TEXT);
+        CREATE TABLE IF NOT EXISTS dup_ignored(key TEXT PRIMARY KEY, ts REAL);
+        CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, field TEXT, value TEXT, category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE, created REAL);
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);''')
+        c.executescript('CREATE INDEX IF NOT EXISTS idx_models_root ON models(root_id); CREATE INDEX IF NOT EXISTS idx_models_status ON models(thumb_status);')
+        if 'info' not in [r[1] for r in c.execute('PRAGMA table_info(models)')]:
+            c.execute('ALTER TABLE models ADD COLUMN info TEXT')  # 3MF-metadata als JSON
+        if 'hash' not in [r[1] for r in c.execute('PRAGMA table_info(models)')]:
+            c.execute('ALTER TABLE models ADD COLUMN hash TEXT')  # inhoud-hash voor de dubbelen-check
+        c.executescript('CREATE INDEX IF NOT EXISTS idx_models_size ON models(size); CREATE INDEX IF NOT EXISTS idx_models_hash ON models(hash);')
+        c.executescript('CREATE TABLE IF NOT EXISTS printers(id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, bed_x REAL, bed_y REAL, bed_z REAL);'
+                        'CREATE TABLE IF NOT EXISTS prints(id INTEGER PRIMARY KEY, model_id INTEGER REFERENCES models(id) ON DELETE CASCADE, ts REAL, result TEXT, printer_id INTEGER,'
+                        ' printer TEXT, plate INTEGER, grams REAL, spool_id INTEGER, spool TEXT, notes TEXT);'
+                        'CREATE INDEX IF NOT EXISTS idx_prints_model ON prints(model_id);'
+                        "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE, pw_hash TEXT, role TEXT DEFAULT 'viewer',"
+                        ' can_download INTEGER DEFAULT 1, active INTEGER DEFAULT 1, ver INTEGER DEFAULT 0, created REAL, last_login REAL);')
+        have = [r[1] for r in c.execute('PRAGMA table_info(models)')]
+        for col, typ in (('notes', 'TEXT'), ('favorite', 'INTEGER DEFAULT 0'), ('source_url', 'TEXT'), ('printed', "TEXT DEFAULT ''"), ('thumb_custom', 'INTEGER DEFAULT 0'), ('container', 'TEXT'), ('member', 'TEXT'), ('pdims', 'TEXT')):
+            if col not in have:
+                c.execute(f'ALTER TABLE models ADD COLUMN {col} {typ}')
+        if 'allow_write' not in [r[1] for r in c.execute('PRAGMA table_info(roots)')]:
+            c.execute('ALTER TABLE roots ADD COLUMN allow_write INTEGER DEFAULT 0')  # hernoemen/verplaatsen toestaan
+        if 'email' not in {r[1] for r in c.execute('PRAGMA table_info(users)')}:
+            c.execute('ALTER TABLE users ADD COLUMN email TEXT')
+        c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE) WHERE email IS NOT NULL')
+        # 3MF-info met onleesbare HTML-entiteiten (oudere versie) opnieuw laten lezen
+        c.execute("UPDATE models SET info=NULL WHERE ext='3mf' AND (info LIKE '%&lt;%' OR info LIKE '%&gt;%' OR info LIKE '%&amp;%' OR info LIKE '%&#%' OR info LIKE '%&quot;%')")
+        # Een model dat tijdens een crash/OOM werd verwerkt mag niet eindeloos opnieuw de app laten crashen:
+        c.execute("UPDATE models SET thumb_status='failed', thumb_error='Verwerking onderbroken (crash of te weinig geheugen?)' WHERE thumb_status='processing'")
+        CFG.update({r['key']: r['value'] for r in c.execute('SELECT * FROM settings')})
+        if CFG['extensions'] == OLD_EXTS:  # ongewijzigde oude standaard -> nieuwe, ruimere lijst
+            CFG['extensions'] = DEFAULT_EXTS
+            c.execute('INSERT OR REPLACE INTO settings VALUES(?,?)', ('extensions', DEFAULT_EXTS))
+    migrate_legacy_auth()
+    if not CFG['session_secret']:
+        put('session_secret', secrets.token_hex(32))
+    app.secret_key = CFG['session_secret']
+    refresh_auth()
+
+
+def put(k, v):
+    CFG[k] = str(v)
+    with db() as c:
+        c.execute('INSERT OR REPLACE INTO settings VALUES(?,?)', (k, str(v)))
+
+
+def bump():
+    global REV
+    REV += 1
+
+
+def hist(event, msg, mid=None):
+    with db() as c:
+        c.execute('INSERT INTO history(ts,event,model_id,message) VALUES(?,?,?,?)', (time.time(), event, mid, msg))
+        c.execute('DELETE FROM history WHERE id < (SELECT MAX(id) FROM history) - 2000')
+    bump()
+
+
+# ---------------------------------------------------------------- hulpfuncties
+LAST_USER = [0.0]
+MTIME_TOL = 2.0  # seconden: Windows/SMB en Linux ronden de wijzigingstijd van hetzelfde bestand soms verschillend af
+YIELD = os.environ.get('YIELD_TO_USERS', '1') != '0'  # 0 = nooit even wachten voor gebruikers (handig bij testen)
+
+
+def thumb_tag(row):
+    """Kenmerk dat in elke thumbnail wordt opgeslagen: model-id + grootte + wijzigingsdatum van het modelbestand."""
+    return f"{row['id']}:{row['size']}:{row['mtime']}"
+
+
+def tag_matches(tag, row):
+    """Hoort dit thumbnail-kenmerk bij het model? De wijzigingstijd mag een paar seconden afwijken (ander platform, andere afronding)."""
+    try:
+        i, s, m = str(tag).split(':')
+        return int(i) == row['id'] and int(s) == row['size'] and abs(float(m) - row['mtime']) <= MTIME_TOL
+    except ValueError:
+        return False
+NETFS = ('nfs', 'nfs4', 'cifs', 'smb3', 'smbfs', 'afs', 'ncpfs', '9p', 'fuse.sshfs', 'fuse.rclone', 'fuse.s3fs', 'fuse.gcsfuse')
+
+
+ZIP_MAX_ENTRIES = 5000
+ARCHIVE_EXTS = ('.zip', '.rar', '.7z')
+
+
+def zip_members(path, allowed):
+    """Modellen in een zip, zonder uitpakken: [(naam in zip, stam, extensie, grootte)]; None als het zip onleesbaar is."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            out = []
+            for i in z.infolist()[:ZIP_MAX_ENTRIES]:
+                base = posixpath.basename(i.filename)
+                if i.is_dir() or i.flag_bits & 1 or i.filename.startswith('__MACOSX/') or not base or base.startswith('.'):
+                    continue  # map, versleuteld, macOS-rommel of verborgen bestand
+                stem, e = os.path.splitext(base)
+                if e.lower() not in allowed or e.lower() in ARCHIVE_EXTS or i.file_size > MAX_MB * 2 ** 20:
+                    continue
+                out.append((i.filename, stem, e[1:].lower(), i.file_size))
+            return out
+    except (zipfile.BadZipFile, OSError, NotImplementedError, RuntimeError):
+        return None
+
+
+@contextlib.contextmanager
+def materialize(row):
+    """Echt bestandspad voor een model. Zit het in een zip, dan wordt alleen dat onderdeel tijdelijk uitgepakt (en daarna opgeruimd)."""
+    if not row['container']:
+        yield row['path']
+        return
+    d = os.path.join(CONFIG, 'tmp')
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix='.' + row['ext'], dir=d)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(row['container']) as z, z.open(row['member']) as src, open(tmp, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+        yield tmp
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def member_hash(container, member):
+    h = hashlib.blake2b(digest_size=16)
+    with zipfile.ZipFile(container) as z, z.open(member) as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+SLICERS = {'bambustudio': ('Bambu Studio', 'bambustudio://open?file='), 'orcaslicer': ('OrcaSlicer', 'orcaslicer://open?file='),
+           'prusaslicer': ('PrusaSlicer', 'prusaslicer://open?file=')}
+LINK_TTL = 600
+OPEN_OK = os.name == 'nt' or sys.platform == 'darwin' or bool(shutil.which('xdg-open'))
+
+
+def _sign(mid, exp):
+    if not CFG['link_secret']:
+        put('link_secret', secrets.token_hex(32))
+    return hmac.new(CFG['link_secret'].encode(), f'{mid}.{exp}'.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def make_token(mid, ttl=LINK_TTL):
+    exp = int(time.time()) + ttl
+    return f'{mid}.{exp}.{_sign(mid, exp)}'
+
+
+def check_token(tok):
+    """Model-id als de link geldig en niet verlopen is, anders None."""
+    try:
+        mid, exp, sig = tok.split('.')
+        if hmac.compare_digest(sig, _sign(int(mid), int(exp))) and int(exp) >= time.time():
+            return int(mid)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def is_local():
+    """Zit de gebruiker op dezelfde computer als de app, en kan die daar bestanden openen?"""
+    u = g.get('user')
+    return (OPEN_OK and request.remote_addr in ('127.0.0.1', '::1') and not (u and u['role'] != 'admin')
+            and not any(request.headers.get(h) for h in ('X-Forwarded-For', 'Forwarded', 'X-Real-IP')))  # via een reverse proxy lijkt iedereen lokaal
+
+
+def open_file(path):
+    if os.name == 'nt':
+        os.startfile(path)
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', path])
+    else:
+        subprocess.Popen(['xdg-open', path])
+
+
+def clean_path(s):
+    """Pad uit een invoerveld opschonen: spaties en aanhalingstekens weg (Windows 'Kopiëren als pad' zet er aanhalingstekens omheen)."""
+    return (s or '').strip().strip('"').strip("'").strip()
+
+
+def unc_server_only(p):
+    """True bij '\\\\server' zonder share: zo'n pad is niet te bladeren."""
+    q = p.replace('/', '\\').rstrip('\\')
+    return q.startswith('\\\\') and q.count('\\') == 2
+
+
+def windows_drives(get_mask=None):
+    """Beschikbare stationsletters. GetLogicalDrives raakt het netwerk niet aan (geen wachten op niet-bereikbare schijven)."""
+    try:
+        if get_mask is None:
+            import ctypes
+            get_mask = ctypes.windll.kernel32.GetLogicalDrives
+        mask = get_mask()
+        return [f'{chr(65 + i)}:\\' for i in range(26) if mask >> i & 1]
+    except Exception:
+        return [f'{d}:\\' for d in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' if os.path.isdir(f'{d}:\\')]
+
+
+def unc_of(path, api=None):
+    """UNC-pad van een pad op een gekoppelde netwerkschijf (Z:\\map -> \\\\nas\\share\\map); None als het geen netwerkschijf is."""
+    drive = ntpath.splitdrive(path)[0]
+    if len(drive) != 2 or drive[1] != ':':
+        return None
+    try:
+        import ctypes
+        if api is None:
+            if os.name != 'nt':
+                return None
+            api = ctypes.windll.mpr.WNetGetConnectionW
+        buf, n = ctypes.create_unicode_buffer(1024), ctypes.c_ulong(1024)
+        if api(drive, buf, ctypes.byref(n)) != 0 or not buf.value:
+            return None
+        return buf.value.rstrip('\\') + path[2:]
+    except Exception:
+        return None
+
+
+def yield_to_users(cap=3.0):
+    """Even wachten als iemand de app gebruikt, zodat de interface vlot blijft (max. `cap` seconden)."""
+    if not YIELD:
+        return
+    t0 = time.time()
+    while time.time() - LAST_USER[0] < 2 and time.time() - t0 < cap:
+        time.sleep(.3)
+
+
+def fs_type(path, mounts=None):
+    """Bestandssysteemtype van de mount waar `path` op staat (Linux, via /proc/mounts); '' als onbekend."""
+    try:
+        txt = mounts if mounts is not None else open('/proc/mounts').read()
+    except OSError:
+        return ''
+    p, best = os.path.realpath(path), ('', '')
+    for line in txt.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mp = parts[1].replace('\\040', ' ')
+        if (p == mp or p.startswith(mp.rstrip('/') + '/')) and len(mp) >= len(best[0]):
+            best = (mp, parts[2])
+    return best[1]
+
+
+def config_on_network():
+    """Type netwerkshare als de config-map (database) daarop staat, anders ''."""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            full = os.path.abspath(CONFIG)
+            if full.startswith('\\\\'):
+                return 'smb'
+            return 'netwerkschijf' if ctypes.windll.kernel32.GetDriveTypeW(os.path.splitdrive(full)[0] + '\\') == 4 else ''
+        except Exception:
+            return ''
+    t = fs_type(CONFIG)
+    return t if t in NETFS or t.startswith(('nfs', 'cifs', 'smb')) else ''
+
+
+# ---------------------------------------------------------------- scannen
+scan_lock = threading.Lock()
+SCANP = dict(phase='', dirs=0, files=0, added=0, total=0)  # voortgang van de lopende scan (voor de balk in de webinterface)
+T = dict(scan=dict(last=None, dur=None, running=False), rebuild=dict(last=None), backup=dict(last=None, dur=None), thumbcheck=dict(last=None))
+NEXT, dirty, CUR, OBS = dict(scan=0, soon=0, backup=time.time() + 3600), {}, {}, {}
+STABLE = {}  # pad -> (grootte, sinds wanneer onveranderd): netwerk-kopieën behouden vaak een oude mtime
+
+
+def exts():
+    return {'.' + e.strip().lower().lstrip('.') for e in CFG['extensions'].split(',') if e.strip()}
+
+
+def walk_top(p, pm=os.path):
+    """Een kale drive of share (C: of \\\\server\\share) krijgt een slash erachter: nieuwere Python-versies plakken er anders de mapnaam direct achter (\\\\server\\sharemap)."""
+    return p + pm.sep if p and pm.splitdrive(p)[0] == p else p
+
+
+def _scan_root(r, allowed, min_age):
+    root, young, now = r['path'], 0, time.time()
+    SCANP['phase'] = 'zoeken'
+    if not os.path.isdir(root):
+        log.warning('Root folder niet bereikbaar, overgeslagen: %s', root)
+        return 0
+    zip_on = CFG['zip_support'] == '1'
+
+    def unstable(p, size, mt):
+        """Nog in beweging? Jong volgens mtime, of de grootte is de laatste min_age seconden veranderd."""
+        if now - mt < min_age:
+            return True
+        s = STABLE.get(p)
+        if s is None or s[0] != size:
+            STABLE[p] = (size, now)
+            return min_age > 0
+        if now - s[1] < min_age:
+            return True
+        del STABLE[p]
+        return False
+
+    found, zips, errs, links, seen, ndirs, top_sub = {}, [], [], [], set(), 0, 0
+    for d, dirs, files in os.walk(walk_top(root), followlinks=FOLLOW_LINKS, onerror=errs.append):
+        ndirs += 1
+        SCANP['dirs'] += 1
+        if ndirs == 1:
+            top_sub = len([x for x in dirs if not x.startswith(('.', '@', '#', '$'))])
+        if FOLLOW_LINKS:  # symlinks volgen zonder in een kringetje te belanden
+            rp = os.path.realpath(d)
+            if rp in seen:
+                dirs[:] = []
+                continue
+            seen.add(rp)
+        else:
+            links += [os.path.join(d, x) for x in dirs if os.path.islink(os.path.join(d, x))]
+        dirs[:] = [x for x in dirs if not x.startswith(('.', '@', '#', '$')) and x != 'System Volume Information']  # o.a. Synology @eaDir/#recycle, Windows $RECYCLE.BIN
+        for f in files:
+            stem, e = os.path.splitext(f)
+            is_zip = zip_on and e.lower() == '.zip'
+            if f.startswith('.') or (e.lower() not in allowed and not is_zip):
+                continue
+            p = os.path.join(d, f)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if is_zip:
+                zips.append((p, st.st_size, st.st_mtime))
+            if e.lower() in allowed:
+                found[p] = (stem, e[1:].lower(), st.st_size, st.st_mtime)
+                SCANP['files'] += 1
+    if ndirs == 1 and top_sub:
+        log.warning('Root folder %s: alleen de hoofdmap is doorzocht, de %d submappen niet (symbolische links of een leesfout?).', root, top_sub)
+    for e_ in errs[:10]:
+        log.warning('Map niet te lezen, overgeslagen: %s (%s)', e_.filename, e_.strerror or e_)
+    if len(errs) > 10:
+        log.warning('Nog %d mappen niet te lezen in %s', len(errs) - 10, root)
+    for l_ in links[:10]:
+        log.warning('Map is een symbolische link en wordt niet gevolgd: %s (zet FOLLOW_SYMLINKS=1 om links te volgen)', l_)
+    if len(links) > 10:
+        log.warning('Nog %d symbolische links overgeslagen in %s', len(links) - 10, root)
+    zset = {z[0] for z in zips}
+    for k in [k for k in STABLE if k.startswith(root) and k not in found and k not in zset]:
+        del STABLE[k]
+    ev, meta = [], {}
+    with db() as c:
+        ex = {x['path']: x for x in c.execute('SELECT * FROM models WHERE root_id=?', (r['id'],))}
+        taken = {x[0] for x in c.execute('SELECT path FROM models WHERE root_id<>?', (r['id'],))}  # path is uniek voor de hele database: bestanden van een andere root (overlappende roots) niet nogmaals toevoegen
+        skipped = 0
+        def sig(size, mt, e, member):  # zelfde bestand onder nieuwe naam/map herkennen
+            return (size, mt, e) + ((posixpath.basename(member),) if member else ())
+
+        orphan = {sig(x['size'], x['mtime'], x['ext'], x['member']) for x in ex.values() if x['container'] and x['container'] not in zset}
+        for zp, zsize, zmt in zips:  # modellen in zips (zonder uitpakken)
+            old = {k: x for k, x in ex.items() if x['container'] == zp}
+            keep = bool(old) and all(abs(x['mtime'] - zmt) <= MTIME_TOL for x in old.values())  # zip ongewijzigd sinds de vorige scan
+            if not keep:
+                mem = zip_members(zp, allowed)
+                moved = mem is not None and any(sig(ms, zmt, me, nm) in orphan for nm, _, me, ms in mem)  # verplaatst/hernoemd zip: niet wachten
+                if not moved and unstable(zp, zsize, zmt):  # wordt nog gekopieerd: bestaande modellen laten staan
+                    young += 1
+                    keep = True
+                elif mem is None:
+                    log.warning('Zip niet te lezen, overgeslagen: %s', zp)
+                    keep = True
+                else:
+                    for name, mstem, mext, msize in mem:
+                        vp = f'{zp}!/{name}'
+                        found[vp], meta[vp] = (mstem, mext, msize, zmt), (zp, name)
+            if keep:
+                for k, x in old.items():
+                    found[k], meta[k] = (x['name'], x['ext'], x['size'], x['mtime']), (zp, x['member'])
+        if ex and not found:
+            log.warning('Root folder %s lijkt leeg terwijl %d modellen bekend zijn; niets verwijderd (mount offline?)', root, len(ex))
+            return 0
+
+        gone = {p: x for p, x in ex.items() if p not in found}
+        bysig = {sig(x['size'], x['mtime'], x['ext'], x['member']): x for x in gone.values()}
+        SCANP.update(phase='bijwerken', total=len(found), added=0)
+        last_bump, batch = time.time(), 0
+        for p, (stem, e, size, mt) in found.items():
+            if batch >= 500:  # tussentijds vastleggen: modellen verschijnen al tijdens een grote scan, en een fout later in de scan draait niet alles terug
+                c.commit()
+                batch = 0
+                if time.time() - last_bump > 2:
+                    bump()
+                    last_bump = time.time()
+            st0 = 'pending' if e in render.CAN_THUMB else 'unsupported'
+            cont, mem = meta.get(p, (None, None))
+            row = ex.get(p)
+            if row:
+                if row['size'] != size or abs(row['mtime'] - mt) > MTIME_TOL:
+                    if not cont and unstable(p, size, mt):  # nog in beweging (kopie bezig)
+                        young += 1
+                        continue
+                    c.execute('UPDATE models SET size=?, mtime=?, thumb_status=?, thumb_error=NULL, info=NULL, hash=NULL, pdims=NULL, thumb_custom=0 WHERE id=?', (size, mt, st0, row['id']))
+                    ev.append(('Gewijzigd', f'{stem}.{e} is gewijzigd, thumbnail wordt vernieuwd', row['id']))
+                continue
+            if p in taken:
+                skipped += 1
+                continue
+            mv = bysig.pop(sig(size, mt, e, mem), None)  # eerder al volledig gezien
+            if not mv and not cont and unstable(p, size, mt):
+                young += 1
+                continue
+            if mv:
+                c.execute('UPDATE models SET path=?, name=?, container=?, member=? WHERE id=?', (p, stem, cont, mem, mv['id']))
+                gone.pop(mv['path'], None)
+                ev.append(('Verplaatst', f"{posixpath.basename(mv['path'].replace(chr(92), '/'))} → {stem}.{e}", mv['id']))
+            else:
+                cur = c.execute('INSERT INTO models(root_id,path,name,ext,size,mtime,added_at,thumb_status,container,member) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                                (r['id'], p, stem, e, size, mt, now, st0, cont, mem))
+                batch += 1
+                SCANP['added'] += 1
+                ev.append(('Toegevoegd', f'{stem}.{e}' + (f' (in {os.path.basename(cont)})' if cont else ''), cur.lastrowid))
+        for p, x in gone.items():
+            c.execute('DELETE FROM models WHERE id=?', (x['id'],))
+            ev.append(('Verwijderd', f"{posixpath.basename(p.replace(chr(92), '/'))} niet meer gevonden", None))
+            try:
+                os.remove(os.path.join(THUMBS, f"{x['id']}.png"))
+            except OSError:
+                pass
+    if skipped:
+        log.warning('Root folder %s: %d bestand(en) overgeslagen omdat ze al bij een andere root folder staan (overlappende root folders?)', root, skipped)
+    for e_ in ev:
+        hist(*e_)
+    new_ids = [e_[2] for e_ in ev if e_[0] == 'Toegevoegd' and e_[2]]
+    if new_ids:
+        try:
+            n = apply_rules(new_ids)
+            if n:
+                log.info('Regels: %d categorie-koppeling(en) gezet voor nieuwe modellen', n)
+        except Exception as ex:  # indelen is een extra: een fout mag de scan nooit stoppen
+            log.warning('Regels toepassen mislukt: %s', ex)
+    if ev:
+        log.info('Scan %s: %d wijziging(en)', root, len(ev))
+    return young
+
+
+def scan(root_id=None):
+    if not scan_lock.acquire(blocking=False):
+        return False
+    T['scan']['running'], t0 = True, time.time()
+    SCANP.update(phase='zoeken', dirs=0, files=0, added=0, total=0)
+    bump()
+    try:
+        allowed, min_age = exts(), max(0, int(CFG['min_age']))
+        with db() as c:
+            roots = [dict(r) for r in c.execute('SELECT * FROM roots' + (' WHERE id=?' if root_id else ''), (root_id,) if root_id else ())]
+        young = sum(_scan_root(r, allowed, min_age) for r in roots)
+        if root_id is None:
+            check_thumbs(False)
+        if young:
+            NEXT['soon'] = time.time() + min_age + 1
+    except Exception as e:
+        log.exception('Scan mislukt: %s', e)
+    finally:
+        T['scan'].update(running=False, last=time.time(), dur=time.time() - t0)
+        SCANP.update(phase='')
+        scan_lock.release()
+        bump()
+    return True
+
+
+# ---------------------------------------------------------------- thumbnail-worker
+def why(e):
+    if isinstance(e, MemoryError):
+        return 'Te weinig geheugen om dit model te verwerken'
+    if isinstance(e, zipfile.BadZipFile):
+        return 'Geen geldig 3MF-bestand (beschadigd of nog niet volledig gekopieerd?)'
+    if isinstance(e, ElementTree.ParseError):
+        return 'Bestand bevat ongeldige XML (beschadigd?)'
+    return str(e) or e.__class__.__name__
+
+
+def check_thumbs(deep=False):
+    """Thumbnails die in de database 'ok' zijn maar ontbreken of niet bij het model horen (bijv. na het terugzetten van een
+    back-up) opnieuw laten maken. deep=True leest ook het kenmerk in elke PNG; thumbnails van vóór dit kenmerk (zonder) blijven geldig."""
+    with db() as c:
+        rows = c.execute("SELECT id, size, mtime FROM models WHERE thumb_status='ok'").fetchall()
+    bad = []
+    for r in rows:
+        p = os.path.join(THUMBS, f"{r['id']}.png")
+        if not os.path.exists(p):
+            bad.append((r['id'], 'ontbrak'))
+        elif deep:
+            try:
+                with Image.open(p) as im:
+                    tag = im.info.get('modelbib')
+            except Exception:
+                bad.append((r['id'], 'was onleesbaar'))
+                continue
+            if tag is not None and not tag_matches(tag, r):
+                bad.append((r['id'], 'hoorde bij een ander model of bestand'))
+    if bad:
+        with db() as c:
+            c.executemany("UPDATE models SET thumb_status='pending', thumb_error=NULL, thumb_custom=0 WHERE id=? AND thumb_status='ok'", [(i,) for i, _ in bad])
+        why_ = ', '.join(f'{n}× {w}' for w, n in collections.Counter(w for _, w in bad).items())
+        log.warning('Thumbnails hersteld: %s; ze worden opnieuw gemaakt', why_)
+        hist('Hersteld', f'{len(bad)} thumbnail(s) opnieuw in de wachtrij ({why_})')
+    T['thumbcheck']['last'] = time.time()
+    return len(bad)
+
+
+def rebuild_thumbs():
+    with db() as c:
+        c.executemany("UPDATE models SET thumb_status='pending' WHERE ext=? AND thumb_custom=0", [(e,) for e in render.CAN_THUMB])
+    T['rebuild']['last'] = time.time()
+    bump()
+
+
+def backup_dir():
+    """Waar de back-ups komen: de instelling in de app, anders BACKUP_DIR, anders <config>/backups."""
+    return CFG['backup_dir'].strip() or (os.path.abspath(BACKUP_ENV) if BACKUP_ENV else '') or os.path.join(CONFIG, 'backups')
+
+
+def check_backup_dir(p, create=False):
+    """'' als de map bruikbaar is, anders een foutmelding. Een ontbrekende map wordt alleen aangemaakt met create=True (als je
+    de map zelf opgeeft in de app). Bij een geplande back-up niet: is een share of schijf niet gekoppeld, dan mag er niet
+    stilletjes een lege map op de verkeerde schijf ontstaan waar de back-ups dan terechtkomen."""
+    if not os.path.isabs(p):
+        return 'Geef een volledig pad op, zoals /backups of D:\\Back-ups'
+    try:
+        if not os.path.isdir(p):
+            if not create:
+                return f'Back-upmap bestaat niet (is de share of schijf gekoppeld?): {p}'
+            os.makedirs(p, exist_ok=True)
+        t = os.path.join(p, '.modelarr-schrijftest')
+        with open(t, 'w') as f:
+            f.write('ok')
+        os.remove(t)
+    except OSError as e:
+        return f'Back-upmap is niet beschrijfbaar: {e.strerror or e}'
+    return ''
+
+
+BACKUP_LOCK = threading.Lock()
+
+
+def backup():
+    if not BACKUP_LOCK.acquire(blocking=False):  # er loopt er al een (bijv. net gestart door het opslaan van de map)
+        return
+    try:
+        _backup()
+    finally:
+        BACKUP_LOCK.release()
+
+
+def _backup():
+    """Maakt een back-up in de ingestelde map. Altijd daar: valt de map weg (bijv. een NAS die uit staat), dan mislukt de
+    back-up met een melding en volgt na een uur een nieuwe poging; er wordt niet stilletjes naar een andere map geschreven.
+    De database wordt eerst lokaal gekopieerd en daarna als .part naar de doelmap, zodat SQLite nooit op een netwerkshare
+    schrijft en een halve kopie (verbinding weg) nooit voor een echte back-up kan doorgaan."""
+    t0, d = time.time(), backup_dir()
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    dest, zdest = os.path.join(d, f'library-{stamp}.db'), os.path.join(d, f'library-{stamp}-thumbs.zip')
+    tmp = os.path.join(CONFIG, f'.backup-{stamp}.tmp')
+    try:
+        err = check_backup_dir(d, create=(d == os.path.join(CONFIG, 'backups')))  # alleen de standaardmap maakt zichzelf aan
+        if err:
+            raise OSError(err)
+        src, dst = sqlite3.connect(DB), sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        shutil.copyfile(tmp, dest + '.part')
+        os.replace(dest + '.part', dest)
+        if CFG['backup_thumbs'] == '1':  # PNG's zijn al gecomprimeerd: alleen opslaan, niet nogmaals comprimeren
+            with zipfile.ZipFile(zdest + '.part', 'w', zipfile.ZIP_STORED) as z:
+                for f in sorted(os.listdir(THUMBS)):
+                    if f.endswith('.png'):
+                        z.write(os.path.join(THUMBS, f), f)
+            os.replace(zdest + '.part', zdest)
+        keep = max(1, int(CFG['backup_keep']))
+        for suffix in ('.db', '-thumbs.zip'):
+            for old in sorted(f for f in os.listdir(d) if f.startswith('library-') and f.endswith(suffix))[:-keep]:
+                os.remove(os.path.join(d, old))
+    except Exception as e:
+        for p in (dest + '.part', zdest + '.part'):
+            with contextlib.suppress(OSError):
+                os.remove(p)
+        T['backup'].update(error=str(e), failed=time.time())
+        NEXT['backup'] = time.time() + 3600
+        log.error('Back-up naar %s mislukt: %s (nieuwe poging over een uur)', d, e)
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+    T['backup'].update(last=time.time(), dur=time.time() - t0, error=None, dir=d)
+    log.info('Back-up gemaakt: %s%s', dest, ' (met thumbnails)' if CFG['backup_thumbs'] == '1' else '')
+    return True
+
+
+def file_hash(path):
+    h = hashlib.blake2b(digest_size=16)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def hash_model(r):
+    """Inhoud hashen (alleen bij bestanden met dezelfde grootte als een ander model) en een identieke kopie melden.
+    '' = onleesbaar: wordt niet eindeloos opnieuw geprobeerd."""
+    try:
+        h = member_hash(r['container'], r['member']) if r['container'] else file_hash(r['path'])
+    except (OSError, zipfile.BadZipFile, KeyError) as e:
+        log.warning('Hashen mislukt voor %s: %s', r['path'], getattr(e, 'strerror', None) or e)
+        h = ''
+    with db() as c:
+        c.execute('UPDATE models SET hash=? WHERE id=? AND size=?', (h, r['id'], r['size']))
+        twin = c.execute('SELECT name, ext FROM models WHERE hash=? AND id<>?', (h, r['id'])).fetchone() if h else None
+    if twin:
+        hist('Dubbel', f"{r['name']}.{r['ext']} is identiek aan {twin['name']}.{twin['ext']}", r['id'])
+    else:
+        bump()
+
+
+# ---------------------------------------------------------------- zware modelverwerking in een apart proces
+ISOLATE = os.environ.get('THUMB_ISOLATE', '1') != '0'
+THUMB_MEM_MB = int(os.environ.get('THUMB_MEM_MB', '4096') or 0)
+THUMB_TIMEOUT = int(os.environ.get('THUMB_TIMEOUT', '600') or 0)  # seconden per model; 0 = geen limiet
+ISO_RECYCLE_JOBS, ISO_RECYCLE_MB = 25, 800  # hulpproces vervangen na zoveel modellen of als het zoveel geheugen vasthoudt
+
+
+class Isolated:
+    """Eén hulpproces (renderproc.py) dat opdrachten uit render.py uitvoert. Loopt het vast, gebruikt het te veel geheugen
+    of duurt het te lang, dan wordt alleen dat proces gestopt: de webserver blijft gewoon werken."""
+
+    def __init__(self):
+        self.p, self.n, self.lock = None, 0, threading.Lock()
+
+    def _stop(self):
+        p, self.p, self.n = self.p, None, 0
+        if p:
+            try:
+                p.kill()
+                p.wait(5)
+            except Exception:
+                pass
+
+    def _rss_mb(self):
+        try:
+            with open(f'/proc/{self.p.pid}/statm') as f:
+                return int(f.read().split()[1]) * (os.sysconf('SC_PAGE_SIZE') // 1024) / 1024
+        except Exception:
+            return 0
+
+    def _read(self, n):
+        buf = b''
+        while len(buf) < n:
+            c = self.p.stdout.read(n - len(buf))
+            if not c:
+                raise EOFError
+            buf += c
+        return buf
+
+    def call(self, fn, *args, **kw):
+        with self.lock:
+            if self.p is None or self.p.poll() is not None:
+                self._stop()
+                env = dict(os.environ, THUMB_MEM_MB=str(THUMB_MEM_MB), OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
+                self.p = subprocess.Popen([sys.executable, os.path.join(BASE, 'renderproc.py')], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                          cwd=BASE, env=env, bufsize=0)
+            import pickle, struct
+            data = pickle.dumps((fn, args, kw), protocol=4)
+            timed_out = []
+            timer = threading.Timer(THUMB_TIMEOUT, lambda: (timed_out.append(1), self.p.kill())) if THUMB_TIMEOUT else None
+            if timer:
+                timer.start()
+            try:
+                self.p.stdin.write(struct.pack('>Q', len(data)) + data)
+                kind, val = pickle.loads(self._read(struct.unpack('>Q', self._read(8))[0]))
+            except (EOFError, OSError):
+                code = self.p.poll() if self.p.poll() is not None else self.p.wait(5)
+                self._stop()
+                if timed_out:
+                    raise RuntimeError(f'Verwerken duurde langer dan {THUMB_TIMEOUT} s (THUMB_TIMEOUT)')
+                raise RuntimeError(f'Verwerking afgebroken (code {code}); waarschijnlijk te weinig geheugen')
+            finally:
+                if timer:
+                    timer.cancel()
+            self.n += 1
+            if self.n >= ISO_RECYCLE_JOBS or self._rss_mb() > ISO_RECYCLE_MB:
+                self._stop()
+            if kind == 'exc':
+                raise val
+            return val
+
+
+_ISO_LOCAL, ISO_VIEW = threading.local(), Isolated()
+
+
+def heavy(fn, *args, view=False, **kw):
+    """render.<fn>(*args) uitvoeren: in een apart, geheugenbegrensd proces (standaard) of in dit proces (THUMB_ISOLATE=0)."""
+    if not ISOLATE:
+        return ('mesh_stl' == fn and render.stl_bytes(*render.load_mesh(*args, **kw))) or getattr(render, fn)(*args, **kw)
+    if view:
+        return ISO_VIEW.call(fn, *args, **kw)
+    if not hasattr(_ISO_LOCAL, 'iso'):
+        _ISO_LOCAL.iso = Isolated()
+    return _ISO_LOCAL.iso.call(fn, *args, **kw)
+
+
+def thumb_for(r, out):
+    with materialize(r) as src:
+        return heavy('make_thumb', src, r['ext'], out, int(CFG['thumb_size']), prefer_embedded=CFG['thumb_source'] == 'embedded', tag=thumb_tag(r))
+
+
+def plate_dims_model(r):
+    """Afmetingen per plaat van een 3MF met meerdere platen bepalen (voor de 'past op printer'-controle). '[]' = geprobeerd, niets gevonden."""
+    try:
+        with materialize(r) as src:
+            pd = heavy('plate_dims', src)
+    except Exception as e:
+        log.warning('Plaatafmetingen bepalen mislukt voor %s: %s', r['path'], why(e))
+        pd = []
+    with db() as c:
+        c.execute('UPDATE models SET pdims=? WHERE id=? AND size=?', (json.dumps(pd), r['id'], r['size']))
+    bump()
+
+
+def read_info(r):
+    """3MF-metadata lezen en opslaan. '{}' = geprobeerd, niets gevonden (voorkomt eindeloos opnieuw proberen)."""
+    try:
+        with materialize(r) as src:
+            info = heavy('info_3mf', src)
+    except Exception as e:
+        log.warning('3MF-info lezen mislukt voor %s: %s', r['path'], why(e))
+        info = {}
+    with db() as c:
+        c.execute('UPDATE models SET info=? WHERE id=?', (json.dumps(info, ensure_ascii=False), r['id']))
+    bump()
+
+
+def worker(first=True):
+    try:  # lage prioriteit: de webinterface blijft vlot, ook op een NAS
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+    except (AttributeError, OSError):
+        pass
+    if first:
+        try:
+            check_thumbs(True)  # o.a. na het terugzetten van een back-up
+        except Exception as e:
+            log.error('Thumbnails controleren mislukt: %s', e)
+    while True:
+        try:
+            if CFG['thumb_paused'] == '1':
+                time.sleep(1)
+                continue
+            with db() as c:
+                r = c.execute("SELECT * FROM models WHERE thumb_status='pending' ORDER BY id LIMIT 1").fetchone()
+                todo = None if r else c.execute("SELECT * FROM models WHERE ext='3mf' AND info IS NULL LIMIT 1").fetchone()
+                dup = None if (r or todo) else c.execute("SELECT * FROM models WHERE hash IS NULL AND size IN (SELECT size FROM models GROUP BY size HAVING COUNT(*) > 1) LIMIT 1").fetchone()
+            if not r:  # niets te renderen: 3MF-info aanvullen, bestanden met gelijke grootte vergelijken, plaatafmetingen bepalen
+                if todo:
+                    read_info(todo)
+                elif dup:
+                    yield_to_users()
+                    hash_model(dup)
+                else:
+                    with db() as c:
+                        pdq = c.execute("SELECT * FROM models WHERE ext='3mf' AND pdims IS NULL AND info LIKE '%\"plates\"%' LIMIT 1").fetchone()
+                    if pdq:
+                        yield_to_users()
+                        plate_dims_model(pdq)
+                    else:
+                        time.sleep(2)
+                continue
+            if r['ext'] == '3mf' and r['info'] is None:
+                read_info(r)
+            yield_to_users()
+            with db() as c:  # atomair claimen: met meerdere workers pakt er maar één dit model
+                if c.execute("UPDATE models SET thumb_status='processing' WHERE id=? AND thumb_status='pending'", (r['id'],)).rowcount != 1:
+                    continue
+            t_start = time.time()
+            CUR.update(id=r['id'], name=r['name'], started=t_start)
+            bump()
+            try:
+                if r['size'] > MAX_MB * 2 ** 20:
+                    raise ValueError(f'Bestand groter dan {MAX_MB} MB (MAX_FILE_MB)')
+                info = thumb_for(r, os.path.join(THUMBS, f"{r['id']}.png"))
+                with db() as c:
+                    c.execute("UPDATE models SET thumb_status='ok', thumb_error=NULL, thumb_at=?, dx=?, dy=?, dz=?, tris=? WHERE id=? AND thumb_status='processing'",
+                              (time.time(), *info['dims'], info['tris'], r['id']))
+                log.info('Thumbnail gemaakt: %s (%d driehoeken, %.1fs)', r['name'], info['tris'], time.time() - t_start)
+            except render.NoPreview as e:
+                with db() as c:
+                    c.execute("UPDATE models SET thumb_status='unsupported', thumb_error=? WHERE id=? AND thumb_status='processing'", (str(e)[:300], r['id']))
+            except Exception as e:
+                with db() as c:
+                    c.execute("UPDATE models SET thumb_status='failed', thumb_error=? WHERE id=? AND thumb_status='processing'", (why(e)[:300], r['id']))
+                log.warning('Thumbnail mislukt voor %s: %s', r['path'], why(e))
+                hist('Mislukt', f"Thumbnail voor {r['name']}.{r['ext']}: {why(e)[:150]}", r['id'])
+            if CUR.get('id') == r['id']:
+                CUR.clear()
+            bump()
+            time.sleep(max(0.0, float(CFG['thumb_delay'])))
+        except Exception as e:
+            log.error('Worker-fout: %s', e)
+            time.sleep(5)
+
+
+# ---------------------------------------------------------------- planner + bestandswachter
+def scheduler():
+    while True:
+        time.sleep(1)
+        now = time.time()
+        try:
+            if now >= NEXT['scan']:
+                NEXT['scan'] = now + max(1, int(CFG['scan_interval'])) * 60
+                scan()
+            if NEXT['soon'] and now >= NEXT['soon']:
+                NEXT['soon'] = 0
+                scan()
+            if now >= NEXT['backup']:
+                NEXT['backup'] = now + 86400
+                backup()
+            for rid, t in list(dirty.items()):
+                if now - t >= 3:  # debounce: wacht tot het rustig is
+                    dirty.pop(rid, None)
+                    if not scan(rid):
+                        dirty[rid] = now
+        except Exception as e:
+            log.error('Planner-fout: %s', e)
+
+
+def sync_watchers():
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+    except ImportError:
+        return
+    with db() as c:
+        want = {r['id']: r['path'] for r in c.execute('SELECT * FROM roots WHERE watch=1') if os.path.isdir(r['path'])}
+    for rid in list(OBS):
+        if want.get(rid) != OBS[rid][1]:
+            try:
+                OBS.pop(rid)[0].stop()
+            except Exception:  # nog niet (helemaal) gestart: niets om te stoppen
+                pass
+
+    def handler(rid):
+        class H(FileSystemEventHandler):
+            def on_any_event(self, event):
+                if event.event_type not in ('opened', 'closed_no_write') and '@eaDir' not in str(event.src_path):
+                    dirty[rid] = time.time()
+        return H()
+
+    for rid, path in want.items():
+        if rid in OBS:
+            continue
+        net = fs_type(path) if os.name != 'nt' else ''
+        if net in NETFS or net.startswith(('nfs', 'cifs', 'smb')):
+            # Op NFS/SMB komen wijzigingen van andere computers niet binnen, en het opzetten van de wachter loopt eerst de hele
+            # mappenboom over het netwerk af (minuten bij tienduizenden bestanden). Daarom alleen periodiek scannen.
+            log.info('Bestandswachter overgeslagen voor %s: netwerkshare (%s). Er wordt elke %s min gescand.', path, net, CFG['scan_interval'])
+            continue
+        try:
+            o = Observer()
+            o.schedule(handler(rid), path, recursive=True)
+            o.daemon = True
+            OBS[rid] = (o, path)
+            threading.Thread(target=_start_observer, args=(o, rid, path), daemon=True).start()  # niet wachten: het opzetten kan lang duren
+        except Exception as e:
+            OBS.pop(rid, None)
+            log.warning('Bestandswachter niet actief voor %s (%s); terugval op periodiek scannen', path, e)
+
+
+def _start_observer(o, rid, path):
+    """Start de wachter op de achtergrond: watchdog loopt hierbij de hele mappenboom af, en de webserver mag daar niet op wachten."""
+    t0 = time.time()
+    try:
+        o.start()
+        if OBS.get(rid, (None,))[0] is not o:  # intussen weer uitgezet: meteen stoppen
+            o.stop()
+            return
+        log.info('Bestandswachter actief: %s (%.1fs)', path, time.time() - t0)
+    except Exception as e:
+        if OBS.get(rid, (None,))[0] is o:
+            OBS.pop(rid, None)
+        log.warning('Bestandswachter niet actief voor %s (%s); terugval op periodiek scannen', path, e)
+
+
+# ---------------------------------------------------------------- authenticatie (optioneel)
+@app.before_request
+def mark_user():
+    p = request.path
+    if p.startswith('/api/') and p != '/api/rev' and not p.startswith('/api/thumb/') and not request.headers.get('X-Auto'):  # X-Auto = automatisch herladen door de pagina zelf
+        LAST_USER[0] = time.time()
+
+
+# ---------------------------------------------------------------- gebruikers en toegang
+OPEN_PATHS = ('/', '/ping', '/api/login', '/api/me')  # nodig om de inlogpagina te kunnen tonen
+USERNAME_RE = re.compile(r'^[\w.@-]{1,40}$')
+
+
+def refresh_auth():
+    """Inloggen is verplicht zodra er minstens één account is."""
+    with db() as c:
+        AUTH_ON[0] = c.execute('SELECT COUNT(*) FROM users').fetchone()[0] > 0
+    OKAUTH.clear()
+
+
+def migrate_legacy_auth():
+    """De oude enkele inlog (instellingen auth_user/auth_hash) omzetten naar een beheerdersaccount."""
+    name = CFG['auth_user']
+    if name and CFG['auth_hash']:
+        with db() as c:
+            if not c.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
+                c.execute("INSERT INTO users(username, pw_hash, role, created) VALUES(?,?, 'admin', ?)", (name, CFG['auth_hash'], time.time()))
+                log.info('Bestaande inlog omgezet naar beheerdersaccount "%s"', name)
+        put('auth_user', '')
+        put('auth_hash', '')
+
+
+def bootstrap_env_admin():
+    """AUTH_USER/AUTH_PASS: maakt bij de eerste start een beheerdersaccount aan als er nog geen accounts zijn."""
+    u, p = os.environ.get('AUTH_USER', '').strip(), os.environ.get('AUTH_PASS', '')
+    if u and p and not AUTH_ON[0]:
+        with db() as c:
+            c.execute("INSERT INTO users(username, pw_hash, role, created) VALUES(?,?, 'admin', ?)", (u, generate_password_hash(p), time.time()))
+        refresh_auth()
+        log.info('Beheerdersaccount "%s" aangemaakt via AUTH_USER/AUTH_PASS', u)
+
+
+EMAIL_RE = re.compile(r'^[^@\s]{1,64}@[^@\s]+\.[^@\s]+$')
+
+
+def parse_email(v):
+    """(adres of None, foutmelding of None): een leeg veld betekent: geen e-mailadres."""
+    e = str(v or '').strip()
+    if not e:
+        return None, None
+    if len(e) > 254 or not EMAIL_RE.match(e):
+        return None, 'Ongeldig e-mailadres'
+    return e, None
+
+
+def find_login(c, name):
+    """Actieve gebruiker op gebruikersnaam of e-mailadres (hoofdletterongevoelig); een gebruikersnaam gaat voor."""
+    return c.execute('SELECT * FROM users WHERE active=1 AND (username=? OR email=? COLLATE NOCASE) ORDER BY (username=?) DESC LIMIT 1', (name, name, name)).fetchone()
+
+
+def current_user():
+    """(gebruiker, via): via API-sleutel, sessiecookie of Basic-authenticatie. (None, None) zonder geldige inlog."""
+    key = request.headers.get('X-Api-Key')
+    if key and CFG['api_key'] and hmac.compare_digest(key.encode(), CFG['api_key'].encode()):
+        return dict(id=0, username='api', role='admin', can_download=1), 'key'
+    if session.get('uid'):
+        with db() as c:
+            r = c.execute('SELECT * FROM users WHERE id=? AND active=1', (session['uid'],)).fetchone()
+        if r and r['ver'] == session.get('ver'):
+            return dict(r), 'session'
+    a = request.authorization
+    if a and a.username and a.password is not None:
+        with db() as c:
+            r = find_login(c, a.username)
+        if r:
+            d = hashlib.sha256(f"{r['id']}:{r['ver']}:{a.password}".encode()).hexdigest()
+            if d in OKAUTH or check_password_hash(r['pw_hash'], a.password):
+                OKAUTH.add(d)
+                return dict(r), 'basic'
+    return None, None
+
+
+def viewer_ok(user):
+    """Wat een gast (rol 'viewer') mag: bekijken; downloaden en openen in de slicer alleen met toestemming."""
+    p, m = request.path, request.method
+    if m == 'GET' and (p in ('/api/library', '/api/rev', '/api/printers') or p.startswith('/api/thumb/')):
+        return True
+    if user['can_download']:
+        if m == 'GET' and (p.startswith('/api/mesh/') or p.startswith('/api/file/')):
+            return True
+        if m == 'POST' and re.fullmatch(r'/api/models/\d+/link', p):
+            return True
+    return m == 'POST' and p == '/api/logout'
+
+
+@app.before_request
+def guard():
+    p = request.path
+    g.user = g.via = None
+    if p in OPEN_PATHS or p.startswith('/dl/') or p.startswith('/static/'):  # /dl/: de ondertekende link is zelf de toegang
+        return
+    if not AUTH_ON[0]:  # nog geen accounts: iedereen is beheerder (de app waarschuwt hiervoor)
+        g.user, g.via = dict(id=0, username='', role='admin', can_download=1), 'open'
+        return
+    user, via = current_user()
+    if user is None:
+        return jsonify(error='Inloggen vereist', login=True), 401
+    g.user, g.via = user, via
+    if user['role'] != 'admin' and not viewer_ok(user):
+        return jsonify(error='Je account heeft hier geen toestemming voor'), 403
+    if request.method in ('POST', 'PUT', 'DELETE', 'PATCH') and via == 'session' and request.headers.get('X-Requested-With') != 'modelbib':
+        return jsonify(error='Ongeldig verzoek'), 403  # bescherming tegen verzoeken vanaf andere websites
+
+
+def me_payload(u):
+    if not AUTH_ON[0]:
+        return dict(auth=False, user=None, role='admin', can_download=True)
+    if not u:
+        return dict(auth=True, user=None, role=None, can_download=False)
+    return dict(auth=True, user=u['username'], role=u['role'], can_download=bool(u['can_download']))
+
+
+@app.get('/api/me')
+def me():
+    return jsonify(me_payload(current_user()[0] if AUTH_ON[0] else None))
+
+
+@app.post('/api/login')
+def login():
+    ip = request.remote_addr or '?'
+    now = time.time()
+    FAILS[ip] = [t for t in FAILS.get(ip, []) if now - t < 600]
+    if len(FAILS[ip]) >= 5:
+        return jsonify(error='Te veel mislukte pogingen. Probeer het over 10 minuten opnieuw.'), 429
+    j = request.json or {}
+    with db() as c:
+        r = find_login(c, str(j.get('username') or '').strip())
+    ok = check_password_hash(r['pw_hash'] if r else DUMMY_HASH, str(j.get('password') or '')) and r is not None  # altijd rekenen: geen verschil in tijd
+    if not ok:
+        FAILS[ip].append(now)
+        log.warning('Mislukte inlogpoging voor "%s" vanaf %s', str(j.get('username') or '')[:40], ip)
+        return jsonify(error='Onjuiste gebruikersnaam of wachtwoord'), 401
+    FAILS.pop(ip, None)
+    session.clear()
+    session.permanent = True
+    session['uid'], session['ver'] = r['id'], r['ver']
+    with db() as c:
+        c.execute('UPDATE users SET last_login=? WHERE id=?', (now, r['id']))
+    log.info('Ingelogd: %s', r['username'])
+    return jsonify(me_payload(dict(r)))
+
+
+@app.post('/api/logout')
+def logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+@app.get('/api/users')
+def users_get():
+    with db() as c:
+        rows = [dict(id=r['id'], username=r['username'], email=r['email'] or '', role=r['role'], can_download=bool(r['can_download']), active=bool(r['active']),
+                     created=r['created'], last_login=r['last_login'], me=bool(g.user and r['id'] == g.user['id']))
+                for r in c.execute('SELECT * FROM users ORDER BY username COLLATE NOCASE')]
+    return jsonify(rows)
+
+
+@app.post('/api/users')
+def users_add():
+    j = request.json or {}
+    name, pw = str(j.get('username') or '').strip(), str(j.get('password') or '')
+    if not USERNAME_RE.match(name):
+        return jsonify(error='Gebruikersnaam: 1 tot 40 tekens (letters, cijfers, . _ - @), geen spaties'), 400
+    if not 8 <= len(pw) <= 200:
+        return jsonify(error='Het wachtwoord moet minstens 8 tekens hebben'), 400
+    email, err = parse_email(j.get('email'))
+    if err:
+        return jsonify(error=err), 400
+    first = not AUTH_ON[0]  # het eerste account is altijd beheerder
+    role = 'admin' if first else (j['role'] if j.get('role') in ('admin', 'viewer') else 'viewer')
+    try:
+        with db() as c:
+            if c.execute('SELECT 1 FROM users WHERE username=?', (name,)).fetchone():
+                return jsonify(error='Er bestaat al een gebruiker met die naam'), 409
+            if email and c.execute('SELECT 1 FROM users WHERE email=? COLLATE NOCASE', (email,)).fetchone():
+                return jsonify(error='Dit e-mailadres is al in gebruik'), 409
+            uid = c.execute('INSERT INTO users(username, pw_hash, role, can_download, created, email) VALUES(?,?,?,?,?,?)',
+                            (name, generate_password_hash(pw), role, 1 if j.get('can_download', True) else 0, time.time(), email)).lastrowid
+    except sqlite3.IntegrityError:
+        return jsonify(error='Er bestaat al een gebruiker met die naam of dat e-mailadres'), 409
+    refresh_auth()
+    if first:  # de maker van het eerste account blijft ingelogd
+        session.clear()
+        session.permanent = True
+        session['uid'], session['ver'] = uid, 0
+    log.info('Account aangemaakt: %s (%s)', name, role)
+    return jsonify(id=uid, auto_login=first)
+
+
+@app.put('/api/users/<int:uid>')
+def users_put(uid):
+    j = request.json or {}
+    with db() as c:
+        u = c.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
+        if not u:
+            abort(404)
+        role = j.get('role', u['role'])
+        active = 1 if j.get('active', bool(u['active'])) else 0
+        dl = 1 if j.get('can_download', bool(u['can_download'])) else 0
+        email = u['email']
+        if 'email' in j:
+            email, err = parse_email(j['email'])
+            if err:
+                return jsonify(error=err), 400
+            if email and c.execute('SELECT 1 FROM users WHERE email=? COLLATE NOCASE AND id<>?', (email, uid)).fetchone():
+                return jsonify(error='Dit e-mailadres is al in gebruik'), 409
+        if role not in ('admin', 'viewer'):
+            return jsonify(error='Onbekende rol'), 400
+        others = c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (uid,)).fetchone()[0]
+        if others == 0 and not (role == 'admin' and active):
+            return jsonify(error='Er moet minstens één actieve beheerder blijven'), 400
+        ver, pw_hash = u['ver'], u['pw_hash']
+        if j.get('password'):
+            if not 8 <= len(str(j['password'])) <= 200:
+                return jsonify(error='Het wachtwoord moet minstens 8 tekens hebben'), 400
+            pw_hash, ver = generate_password_hash(str(j['password'])), ver + 1
+        if u['active'] and not active:
+            ver += 1  # lopende sessies ongeldig maken
+        c.execute('UPDATE users SET role=?, active=?, can_download=?, pw_hash=?, ver=?, email=? WHERE id=?', (role, active, dl, pw_hash, ver, email, uid))
+    OKAUTH.clear()
+    if g.via == 'session' and g.user['id'] == uid and active:
+        session['ver'] = ver  # de eigen sessie blijft geldig na het wijzigen van je eigen wachtwoord
+    return jsonify(ok=True)
+
+
+@app.delete('/api/users/<int:uid>')
+def users_del(uid):
+    with db() as c:
+        u = c.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
+        if not u:
+            abort(404)
+        others = c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (uid,)).fetchone()[0]
+        if u['role'] == 'admin' and u['active'] and others == 0:
+            return jsonify(error='Je kunt de laatste beheerder niet verwijderen. Gebruik "Alle accounts verwijderen" om het inloggen uit te zetten.'), 400
+        c.execute('DELETE FROM users WHERE id=?', (uid,))
+    refresh_auth()
+    return jsonify(ok=True)
+
+
+@app.post('/api/users/clear')
+def users_clear():
+    """Alle accounts verwijderen = inloggen uitzetten (iedereen heeft dan weer toegang)."""
+    if not (request.json or {}).get('confirm'):
+        return jsonify(error='Bevestiging ontbreekt'), 400
+    with db() as c:
+        c.execute('DELETE FROM users')
+    refresh_auth()
+    session.clear()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- API
+def one(mid):
+    with db() as c:
+        r = c.execute('SELECT * FROM models WHERE id=?', (mid,)).fetchone()
+    if not r:
+        abort(404)
+    return r
+
+
+@app.get('/ping')
+def ping():
+    return 'ok'
+
+
+@app.get('/')
+def index():
+    return send_from_directory(app.static_folder, 'index.html')
+
+
+@app.get('/api/rev')
+def rev():
+    with db() as c:
+        p = c.execute("SELECT COUNT(*) FROM models WHERE thumb_status='pending'").fetchone()[0]
+        f = c.execute("SELECT COUNT(*) FROM models WHERE thumb_status='failed'").fetchone()[0]
+        ign = ignored_keys(c)
+        d = len(split_ignored(find_duplicates(c.execute('SELECT * FROM models WHERE hash IS NOT NULL').fetchall())[0], ign)[0]) if ign else c.execute("SELECT COUNT(*) FROM (SELECT hash FROM models WHERE hash IS NOT NULL AND hash<>'' GROUP BY hash HAVING COUNT(*) > 1)").fetchone()[0]
+    return jsonify(rev=REV, pending=p, failed=f, dups=d, auth=AUTH_ON[0], scan=dict(SCANP) if T['scan']['running'] and SCANP['phase'] else None)
+
+
+def find_duplicates(rows):
+    """(exact, mesh): lijsten van groepen. exact = identieke inhoud (hash). mesh = zelfde aantal driehoeken en
+    afmetingen maar niet bewezen identiek (bijv. dezelfde mesh als STL en als 3MF, of opnieuw geëxporteerd)."""
+    by_hash, by_mesh = {}, {}
+    for r in rows:
+        if r['hash']:
+            by_hash.setdefault(r['hash'], []).append(r)
+        if r['tris'] and r['dx'] is not None:
+            by_mesh.setdefault((r['tris'], round(r['dx'], 1), round(r['dy'], 1), round(r['dz'], 1)), []).append(r)
+    exact = [g for g in by_hash.values() if len(g) > 1]
+    mesh = [g for g in by_mesh.values() if len(g) > 1 and len({x['hash'] or 'id%d' % x['id'] for x in g}) > 1]
+    return exact, mesh
+
+
+def gkey(g):
+    """Sleutel van een dubbelen-groep: de gesorteerde model-id's. Komt er een kopie bij (of verdwijnt er een), dan is het een andere groep en verschijnt hij weer."""
+    return ','.join(str(i) for i in sorted(int(x['id']) for x in g))
+
+
+def split_ignored(groups, ign):
+    return [g for g in groups if gkey(g) not in ign], [g for g in groups if gkey(g) in ign]
+
+
+def ignored_keys(c):
+    return {r[0] for r in c.execute('SELECT key FROM dup_ignored')}
+
+
+def dup_map(rows, ign=None):
+    exact, mesh = find_duplicates(rows)
+    if ign:
+        exact, mesh = split_ignored(exact, ign)[0], split_ignored(mesh, ign)[0]
+    out = {x['id']: 'mesh' for g in mesh for x in g}
+    out.update({x['id']: 'exact' for g in exact for x in g})
+    return out
+
+
+def _info(s):
+    try:
+        return json.loads(s) if s else None
+    except ValueError:
+        return None
+
+
+_LIBC = dict(v=-1)
+_LIB_LOCK = threading.Lock()
+
+
+def _lib_base():
+    """De volledige modellenlijst (zonder gastmaskering). Wordt onthouden tot er iets in de database verandert, zodat het bladeren door pagina's snel blijft."""
+    with _LIB_LOCK:
+        if _LIBC['v'] == DBW:
+            return _LIBC['models'], _LIBC['categories']
+        v = DBW
+        with db() as c:
+            roots = {r['id']: r['path'] for r in c.execute('SELECT * FROM roots')}
+            rw = {r['id']: bool(r['allow_write']) for r in c.execute('SELECT * FROM roots')}
+            pc = {r['model_id']: r for r in c.execute("SELECT model_id, SUM(result='ok') ok, SUM(result='failed') failed, MAX(ts) last FROM prints GROUP BY model_id")}
+            cats = {}
+            for r in c.execute('SELECT * FROM model_categories'):
+                cats.setdefault(r['model_id'], []).append(r['category_id'])
+            rows = c.execute('SELECT * FROM models').fetchall()
+            dups = dup_map(rows, ignored_keys(c))
+            models = []
+            for r in rows:
+                try:
+                    folder = os.path.relpath(os.path.dirname(r['path']), roots[r['root_id']])
+                except (KeyError, ValueError):
+                    folder = ''
+                models.append(dict(id=r['id'], name=r['name'], display=r['display_name'] or '', ext=r['ext'], path=r['path'],
+                                   folder='' if folder == '.' else folder, size=r['size'], added=r['added_at'],
+                                   status=r['thumb_status'], error=r['thumb_error'], thumb_at=r['thumb_at'] or 0,
+                                   dims=[r['dx'], r['dy'], r['dz']] if r['dx'] is not None else None, tris=r['tris'], info=_info(r['info']), dup=dups.get(r['id'], ''), favorite=bool(r['favorite']), printed=r['printed'] or '', notes=r['notes'] or '',
+                                   source_url=r['source_url'] or '', thumb_custom=bool(r['thumb_custom']), can_rename=rw.get(r['root_id'], False) and not r['container'],
+                                   container=os.path.basename(r['container']) if r['container'] else '', member=r['member'] or '',
+                                   prints_ok=(pc[r['id']]['ok'] if r['id'] in pc else 0), prints_failed=(pc[r['id']]['failed'] if r['id'] in pc else 0),
+                                   last_print=(pc[r['id']]['last'] if r['id'] in pc else None), pdims=_info(r['pdims']),
+                                   cats=cats.get(r['id'], [])))
+            categories = [dict(r) for r in c.execute(
+                'SELECT c.id, c.name, COUNT(mc.model_id) AS count FROM categories c '
+                'LEFT JOIN model_categories mc ON mc.category_id=c.id GROUP BY c.id ORDER BY c.name COLLATE NOCASE')]
+        _LIBC.update(v=v, models=models, categories=categories)
+    return models, categories
+
+
+@app.get('/api/library')
+def library():
+    models, categories = _lib_base()
+    viewer = bool(g.get('user')) and g.user['role'] != 'admin'
+    if viewer:  # gasten zien geen privé-gegevens: notities, logboek, bestandspaden op de schijf (op een kopie: de onthouden lijst blijft ongemoeid)
+        models = [dict(m, path=(f"{m['container']}/{m['member']}" if m['container'] else posixpath.join(m['folder'].replace(os.sep, '/'), f"{m['name']}.{m['ext']}")),
+                       notes='', error=None, can_rename=False, prints_ok=0, prints_failed=0, last_print=None, favorite=False, printed='', dup='') for m in models]
+    out = dict(categories=categories, big_mb=int(CFG['big_mb']), recent_days=int(CFG['recent_days']), spoolman=bool(CFG['spoolman_url']) and not viewer,
+               local=is_local(), slicer=dict(zip(('name', 'scheme'), SLICERS.get(CFG['slicer'], SLICERS['bambustudio']))))
+    if 'page' not in request.args:  # zonder paginaparameters: de hele lijst (API-gebruikers, tests)
+        return jsonify(models=models, **out)
+    # Met paginaparameters filtert, sorteert en pagineert de server; de browser krijgt alleen de zichtbare pagina.
+    with db() as c:
+        beds = {r['id']: r for r in c.execute('SELECT * FROM printers')}
+    a = request.args
+    sel = lib_filter(models, categories, a.get('q', ''), a.get('cat', 'all'), a.get('ext', 'all'), a.get('flt', 'all'), a.get('sort', 'name'), out['recent_days'], out['big_mb'], beds)
+    size = max(0, min(int(a.get('size', 100) or 0), 100000)) if str(a.get('size', '100')).lstrip('-').isdigit() else 100
+    pages = max(1, -(-len(sel) // size)) if size else 1
+    page = max(0, min(int(a.get('page', 0)) if str(a.get('page', '0')).isdigit() else 0, pages - 1))
+    shown = sel[page * size:(page + 1) * size] if size else sel
+    want = int(a['with']) if str(a.get('with', '')).isdigit() else None  # model dat in het venster openstaat, ook als het niet (meer) in het filter past
+    return jsonify(models=shown, total=len(sel), all=len(models), page=page, pages=pages, size=size, ids=[m['id'] for m in sel],
+                   exts=sorted({m['ext'] for m in models}), open=next((m for m in models if m['id'] == want), None) if want else None, **out)
+
+
+_LIB_ALIAS = dict(ext='ext', cat='cat', categorie='cat', map='map', folder='map', naam='naam', name='naam', ontwerper='ontwerper', designer='ontwerper',
+                  notitie='notitie', notities='notitie', note='notitie', bron='bron', source='bron')
+
+
+def _parse_q(q):
+    """'rack ext:3mf cat:"10 inch"' -> [(veld, tekst)]; onbekende prefix telt als gewone tekst (zelfde regels als de zoekbalk)."""
+    out = []
+    for t in re.finditer(r'(?:(\w+):)?(?:"([^"]*)"|(\S+))', (q or '').lower(), re.A):
+        v = t.group(2) if t.group(2) is not None else t.group(3)
+        k = _LIB_ALIAS.get(t.group(1))
+        out.append((k, v) if k else ('all', (t.group(1) + ':' if t.group(1) else '') + v))
+    return out
+
+
+def _fits_dims(d, p):
+    return ((d[0] <= p['bed_x'] + .01 and d[1] <= p['bed_y'] + .01) or (d[0] <= p['bed_y'] + .01 and d[1] <= p['bed_x'] + .01)) and d[2] <= p['bed_z'] + .01
+
+
+def _fits(m, p):  # True/False, of None als de afmetingen (nog) onbekend zijn; meerdere platen: elke plaat moet passen
+    if len((m['info'] or {}).get('plates') or []) > 1:
+        pd = m.get('pdims')
+        return all(_fits_dims(x['dims'], p) for x in pd) if pd else None
+    return _fits_dims(m['dims'], p) if m['dims'] and None not in m['dims'] else None
+
+
+def _hay(m, catnames):
+    i = m['info'] or {}
+    s = lambda x: str(x if x is not None else '').lower()
+    lab = m['display'] or m['name']
+    f = dict(naam=s(f"{lab} {m['name']}.{m['ext']}"), ext=s(m['ext']), map=s(m['folder']), ontwerper=s(f"{i.get('designer') or ''} {i.get('title') or ''}"),
+             cat=' '.join(catnames.get(c, '') for c in m['cats']).lower(), notitie=s(m['notes']), bron=s(m['source_url']))
+    f['all'] = ' '.join(f.values()) + ' ' + s(' '.join(str(i.get(k) or '') for k in ('application', 'printer', 'filament', 'description')))
+    return f
+
+
+def _sortkey(m):
+    t = unicodedata.normalize('NFKD', (m['display'] or m['name'])).casefold()
+    return ''.join(ch for ch in t if not unicodedata.combining(ch))
+
+
+def lib_filter(models, categories, q, cat, ext, flt, sort, recent_days, big_mb, beds):
+    """Dezelfde filters als de bibliotheekweergave: zoeken (met prefixen), categorie, formaat, 'Alle modellen'-lijst en sortering."""
+    toks = _parse_q(q)
+    names = {c['id']: c['name'] for c in categories}
+    now = time.time()
+    fit = beds.get(int(flt[4:])) if flt.startswith('fit:') and flt[4:].isdigit() else None
+    tests = {'nopreview': lambda m: m['status'] != 'ok', 'recent': lambda m: m['added'] > now - recent_days * 86400, 'dup': lambda m: bool(m['dup']),
+             'fav': lambda m: m['favorite'], 'toprint': lambda m: m['printed'] == 'toprint', 'printed': lambda m: m['printed'] == 'printed',
+             'failedprint': lambda m: m['prints_failed'] > 0, 'big': lambda m: m['size'] > big_mb * 2 ** 20}
+    ft = None if flt == 'all' else (lambda m: fit is not None and _fits(m, fit) is True) if flt.startswith('fit:') else tests.get(flt, tests['big'])
+    cid = int(cat) if cat.lstrip('-').isdigit() else None
+    out = []
+    for m in models:
+        if cat == 'none':
+            if m['cats']:
+                continue
+        elif cid is not None and cid not in m['cats']:
+            continue
+        if ext != 'all' and m['ext'] != ext:
+            continue
+        if ft and not ft(m):
+            continue
+        if toks:
+            h = _hay(m, names)
+            if not all(v in h[k] for k, v in toks):
+                continue
+        out.append(m)
+    if sort == 'added':
+        out.sort(key=lambda m: -m['added'])
+    elif sort == 'size':
+        out.sort(key=lambda m: -m['size'])
+    else:
+        out.sort(key=_sortkey)
+    return out
+
+
+@app.get('/api/file/<int:mid>')
+def model_file(mid):
+    """Download het originele bestand. Alleen het model zelf: nooit een pad uit de URL."""
+    r = one(mid)
+    if g.get('user') and g.user['role'] != 'admin':
+        hist('Download', f"{g.user['username']} downloadde {r['name']}.{r['ext']}", mid)
+    return send_model(r, True)
+
+
+def send_model(r, attachment):
+    """Het modelbestand zelf versturen (bij een onderdeel van een zip: alleen dat onderdeel, uitgepakt in het geheugen)."""
+    if r['container']:
+        try:
+            if r['size'] > MAX_MB * 2 ** 20:
+                abort(413)
+            with zipfile.ZipFile(r['container']) as z:
+                data = z.read(r['member'])
+        except (OSError, zipfile.BadZipFile, KeyError):
+            abort(404)
+        return send_file(io.BytesIO(data), as_attachment=attachment, download_name=posixpath.basename(r['member']))
+    if not os.path.isfile(r['path']):
+        abort(404)
+    return send_file(r['path'], as_attachment=attachment, conditional=True)
+
+
+@app.post('/api/models/<int:mid>/link')
+def model_link(mid):
+    """Tijdelijke, ondertekende downloadlink (10 min) zodat een slicer het bestand zelf kan ophalen, zonder wachtwoord in de link."""
+    r = one(mid)
+    if g.get('user') and g.user['role'] != 'admin':
+        hist('Download', f"{g.user['username']} opende {r['name']}.{r['ext']} in de slicer", mid)
+    name = urllib.parse.quote(posixpath.basename(r['member']) if r['container'] else os.path.basename(r['path']))
+    nm, scheme = SLICERS.get(CFG['slicer'], SLICERS['bambustudio'])
+    return jsonify(path=f'/dl/{make_token(mid)}/{name}', slicer=nm, scheme=scheme, expires=LINK_TTL)
+
+
+@app.get('/dl/<token>/<path:name>')
+def model_dl(token, name):
+    mid = check_token(token)
+    if mid is None:
+        return Response('Deze link is ongeldig of verlopen. Maak in de bibliotheek een nieuwe aan.', 403)
+    return send_model(one(mid), False)
+
+
+@app.post('/api/models/<int:mid>/open')
+def model_open(mid):
+    """Openen met het standaardprogramma van het besturingssysteem; alleen als de gebruiker op dezelfde computer zit als de app."""
+    if not is_local():
+        return jsonify(error='Openen met het standaardprogramma kan alleen als de app op dezelfde computer draait als je browser.'), 403
+    r = one(mid)
+    p = r['path']
+    if r['container']:  # onderdeel van een zip: een gewone kopie klaarzetten
+        d = os.path.join(CONFIG, 'open')
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, f"{mid}_{posixpath.basename(r['member'])}")
+        try:
+            with zipfile.ZipFile(r['container']) as z, z.open(r['member']) as src, open(p, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+        except (OSError, zipfile.BadZipFile, KeyError) as e:
+            return jsonify(error=f'Uitpakken mislukt: {e}'), 400
+    if not os.path.isfile(p):
+        return jsonify(error='Bestand niet gevonden'), 404
+    try:
+        open_file(p)
+    except OSError as e:
+        return jsonify(error=f'Openen mislukt: {e.strerror or e}'), 500
+    return jsonify(ok=True)
+
+
+@app.get('/api/mesh/<int:mid>.stl')
+def mesh(mid):
+    r = one(mid)
+    try:
+        with materialize(r) as src:
+            data = heavy('mesh_stl', src, r['ext'], plate=request.args.get('plate', type=int), view=True)
+    except Exception as e:
+        return Response(f'Kan model niet laden: {why(e) if isinstance(e, MemoryError) else e}', 415)
+    return Response(data, mimetype='model/stl')
+
+
+@app.get('/api/thumb/<int:mid>.png')
+def thumb_get(mid):
+    p = os.path.join(THUMBS, f'{mid}.png')
+    if not os.path.exists(p):
+        abort(404)
+    return send_file(p, mimetype='image/png', max_age=86400)
+
+
+PRINTED = ('', 'toprint', 'printed')
+
+
+@app.post('/api/models/<int:mid>')
+def model_update(mid):
+    j, r = request.json or {}, one(mid)
+    if 'source_url' in j:
+        u = (j['source_url'] or '').strip()
+        if u and not u.lower().startswith(('http://', 'https://')):
+            return jsonify(error='Bron moet een link zijn die met http:// of https:// begint'), 400
+        j['source_url'] = u[:500]
+    if 'printed' in j and j['printed'] not in PRINTED:
+        return jsonify(error='Ongeldige printstatus'), 400
+    with db() as c:
+        if 'filename' in j:
+            if r['container']:
+                return jsonify(error='Dit model zit in een zip: alleen de weergavenaam kan worden gewijzigd.'), 400
+            root = c.execute('SELECT allow_write FROM roots WHERE id=?', (r['root_id'],)).fetchone()
+            if not root or not root['allow_write']:
+                return jsonify(error='Hernoemen staat uit voor deze root folder. Zet het aan onder Instellingen → Mediabeheer.'), 403
+            stem = (j['filename'] or '').strip()
+            if not stem or stem.endswith('.') or any(ch in stem for ch in '<>:"/\\|?*'):
+                return jsonify(error='Ongeldige bestandsnaam (leeg of bevat < > : " / \\ | ? *)'), 400
+            old = r['path']
+            new = os.path.join(os.path.dirname(old), stem + os.path.splitext(old)[1])
+            if new != old:
+                if os.path.exists(new) and not os.path.samefile(new, old):
+                    return jsonify(error='Er bestaat al een bestand met die naam'), 409
+                try:
+                    os.rename(old, new)
+                except OSError as e:
+                    return jsonify(error=f'Hernoemen mislukt: {e.strerror or e}'), 400
+                c.execute('UPDATE models SET path=?, name=? WHERE id=?', (new, stem, mid))
+                log.info('Hernoemd: %s -> %s', old, new)
+        if 'display' in j:
+            c.execute('UPDATE models SET display_name=? WHERE id=?', ((j['display'] or '').strip() or None, mid))
+        if 'notes' in j:
+            c.execute('UPDATE models SET notes=? WHERE id=?', ((j['notes'] or '').strip()[:5000] or None, mid))
+        if 'favorite' in j:
+            c.execute('UPDATE models SET favorite=? WHERE id=?', (1 if j['favorite'] else 0, mid))
+        if 'printed' in j:
+            c.execute('UPDATE models SET printed=? WHERE id=?', (j['printed'], mid))
+        if 'source_url' in j:
+            c.execute('UPDATE models SET source_url=? WHERE id=?', (j['source_url'] or None, mid))
+    bump()
+    return jsonify(ok=True)
+
+
+@app.post('/api/models/bulk')
+def models_bulk():
+    j = request.json or {}
+    ids = [(int(i),) for i in j.get('model_ids', [])]
+    if 'printed' in j and j['printed'] not in PRINTED:
+        return jsonify(error='Ongeldige printstatus'), 400
+    with db() as c:
+        if 'favorite' in j:
+            c.executemany('UPDATE models SET favorite=%d WHERE id=?' % (1 if j['favorite'] else 0), ids)
+        if 'printed' in j:
+            c.executemany('UPDATE models SET printed=? WHERE id=?', [(j['printed'], i[0]) for i in ids])
+    bump()
+    return jsonify(ok=True)
+
+
+@app.post('/api/models/<int:mid>/thumb')
+def model_thumb(mid):
+    """Eigen thumbnail (bijv. een opname uit de 3D-viewer). Blijft behouden tot 'Thumbnail opnieuw' of een gewijzigd bestand."""
+    r = one(mid)
+    try:
+        img = Image.open(io.BytesIO(base64.b64decode((request.json or {})['data'].split(',', 1)[1])))
+        img.load()
+    except Exception:
+        return jsonify(error='Ongeldige afbeelding'), 400
+    render.save_png(render.fit_square(img, int(CFG['thumb_size'])), os.path.join(THUMBS, f'{mid}.png'), thumb_tag(r))
+    with db() as c:
+        c.execute("UPDATE models SET thumb_status='ok', thumb_error=NULL, thumb_at=?, thumb_custom=1 WHERE id=?", (time.time(), mid))
+    bump()
+    return jsonify(ok=True)
+
+
+@app.post('/api/models/<int:mid>/regen')
+def model_regen(mid):
+    r = one(mid)
+    with db() as c:
+        c.execute('UPDATE models SET thumb_status=?, thumb_custom=0, thumb_error=NULL WHERE id=?', ('pending' if r['ext'] in render.CAN_THUMB else 'unsupported', mid))
+    bump()
+    return jsonify(ok=True)
+
+
+@app.get('/api/duplicates')
+def duplicates():
+    with db() as c:
+        rows = c.execute('SELECT * FROM models').fetchall()
+        rw = {r['id']: bool(r['allow_write']) for r in c.execute('SELECT * FROM roots')}
+        waiting = c.execute("SELECT COUNT(*) FROM models WHERE hash IS NULL AND size IN (SELECT size FROM models GROUP BY size HAVING COUNT(*) > 1)").fetchone()[0]
+    exact, mesh = find_duplicates(rows)
+    with db() as c:
+        ign = ignored_keys(c)
+    (exact, ig_exact), (mesh, ig_mesh) = split_ignored(exact, ign), split_ignored(mesh, ign)
+    item = lambda r: dict(id=r['id'], name=r['name'], ext=r['ext'], path=r['path'], size=r['size'], added=r['added_at'],
+                          status=r['thumb_status'], thumb_at=r['thumb_at'] or 0, can_write=rw.get(r['root_id'], False) and not r['container'])
+    grp = lambda g: [item(r) for r in sorted(g, key=lambda r: r['added_at'] or 0)]  # oudste eerst
+    exact.sort(key=lambda g: -(len(g) - 1) * g[0]['size'])
+    mesh.sort(key=lambda g: -g[0]['size'])
+    return jsonify(exact=[grp(g) for g in exact], mesh=[grp(g) for g in mesh], ignored=[grp(g) for g in sorted(ig_exact + ig_mesh, key=lambda g: -g[0]['size'])],
+                   wasted=sum((len(g) - 1) * g[0]['size'] for g in exact), waiting=waiting)
+
+
+def _group_of(ids):
+    """De dubbelen-groep die precies bij deze model-id's hoort, of None."""
+    with db() as c:
+        rows = c.execute('SELECT * FROM models').fetchall()
+    want = sorted(int(i) for i in ids)
+    return next((g for g in sum(find_duplicates(rows), []) if sorted(int(x['id']) for x in g) == want), None)
+
+
+@app.post('/api/duplicates/ignore')
+def dup_ignore():
+    j = request.json or {}
+    try:
+        ids = [int(i) for i in j.get('ids') or []]
+    except (TypeError, ValueError):
+        return jsonify(error='Ongeldige groep'), 400
+    g = _group_of(ids) if len(ids) > 1 else None
+    if not g:
+        return jsonify(error='Deze groep bestaat niet (meer); ververs de pagina.'), 409
+    with db() as c:
+        if j.get('ignore', True):
+            c.execute('INSERT OR REPLACE INTO dup_ignored(key, ts) VALUES(?, ?)', (gkey(g), time.time()))
+        else:
+            c.execute('DELETE FROM dup_ignored WHERE key=?', (gkey(g),))
+    bump()
+    return jsonify(ok=True)
+
+
+def _trash(mid, any_file=False):
+    """Verplaatst een bestand naar <root>/.prullenbak (niet definitief wissen). Standaard alleen een dubbel bestand, en alleen als er
+    nog minstens één ander bestand in dezelfde dubbelen-groep zit, zodat nooit de laatste kopie verdwijnt. Met any_file (vanuit de
+    bibliotheek, na bevestiging door de gebruiker) mag elk bestand, maar nog steeds alleen in een root folder waar schrijven aan staat."""
+    with db() as c:
+        r = c.execute('SELECT * FROM models WHERE id=?', (mid,)).fetchone()
+    if not r:
+        return dict(error='Model niet gevonden'), 404
+    if r['container']:
+        return dict(error='Dit model zit in een zip en kan niet apart worden verplaatst.'), 409
+    with db() as c:
+        rows = [] if any_file else c.execute('SELECT * FROM models').fetchall()
+        root = c.execute('SELECT path, allow_write FROM roots WHERE id=?', (r['root_id'],)).fetchone()
+    twins = []
+    if not any_file:
+        exact, mesh = find_duplicates(rows)
+        twins = [x for g in exact + mesh if mid in {y['id'] for y in g} for x in g if x['id'] != mid]
+    if (not twins and not any_file) or not root:
+        return dict(error='Dit is geen dubbel bestand (meer); er is niets verplaatst'), 409
+    if not root['allow_write']:
+        return dict(error='Verplaatsen staat uit voor deze root folder. Zet het aan onder Instellingen → Mediabeheer.'), 403
+    d = os.path.join(walk_top(root['path']), '.prullenbak')
+    dest = os.path.join(d, time.strftime('%Y%m%d-%H%M%S_') + os.path.basename(r['path']))
+    n = 1
+    while os.path.exists(dest):  # gelijke naam in dezelfde seconde (kopieën met dezelfde naam uit verschillende mappen): nooit overschrijven
+        n += 1
+        dest = os.path.join(d, time.strftime('%Y%m%d-%H%M%S_') + f'{n}_' + os.path.basename(r['path']))
+    try:
+        os.makedirs(d, exist_ok=True)
+        shutil.move(r['path'], dest)
+    except OSError as e:
+        return dict(error=f'Verplaatsen mislukt: {e.strerror or e}'), 400
+    with db() as c:
+        c.execute('DELETE FROM models WHERE id=?', (mid,))
+    try:
+        os.remove(os.path.join(THUMBS, f'{mid}.png'))
+    except OSError:
+        pass
+    hist('Prullenbak', f"{os.path.basename(r['path'])} verplaatst naar .prullenbak (dubbel van {twins[0]['name']}.{twins[0]['ext']})" if twins
+         else f"{os.path.basename(r['path'])} naar .prullenbak verplaatst (via de bibliotheek)")
+    return dict(ok=True, dest=dest), 200
+
+
+@app.post('/api/models/<int:mid>/trash')
+def model_trash(mid):
+    out, code = _trash(mid)
+    return jsonify(out), code
+
+
+@app.post('/api/models/trash')
+def models_trash():
+    """Meerdere bestanden in één keer naar de prullenbak. Standaard (duplicatenweergave) wordt elk bestand apart gecontroleerd tegen
+    de actuele groepen: van een groep blijft altijd minstens één kopie staan, ook als je ze allemaal selecteert. Met "any": true
+    (bibliotheek) mag elk bestand, behalve in een zip of in een root folder waar schrijven uit staat."""
+    j = request.json or {}
+    try:
+        ids = list(dict.fromkeys(int(i) for i in j.get('ids') or []))
+    except (TypeError, ValueError):
+        return jsonify(error='Ongeldige selectie'), 400
+    done, failed = 0, []
+    for i in ids[:2000]:
+        out, code = _trash(i, any_file=bool(j.get('any')))
+        if code == 200:
+            done += 1
+        else:
+            failed.append(dict(id=i, error=out['error']))
+    return jsonify(done=done, failed=failed)
+
+
+@app.post('/api/categories')
+def cat_add():
+    name = ((request.json or {}).get('name') or '').strip()
+    if not name:
+        return jsonify(error='Naam ontbreekt'), 400
+    with db() as c:
+        c.execute('INSERT OR IGNORE INTO categories(name) VALUES(?)', (name,))
+        cid = c.execute('SELECT id FROM categories WHERE name=?', (name,)).fetchone()['id']
+    bump()
+    return jsonify(id=cid)
+
+
+@app.put('/api/categories/<int:cid>')
+def cat_rename(cid):
+    name = ((request.json or {}).get('name') or '').strip()
+    if not name:
+        return jsonify(error='Naam ontbreekt'), 400
+    try:
+        with db() as c:
+            c.execute('UPDATE categories SET name=? WHERE id=?', (name, cid))
+    except sqlite3.IntegrityError:
+        return jsonify(error='Er bestaat al een categorie met die naam'), 409
+    bump()
+    return jsonify(ok=True)
+
+
+@app.delete('/api/categories/<int:cid>')
+def cat_del(cid):
+    with db() as c:
+        c.execute('DELETE FROM categories WHERE id=?', (cid,))
+    bump()
+    return jsonify(ok=True)
+
+
+@app.post('/api/assign')
+def assign():
+    j = request.json
+    with db() as c:
+        for mid in j['model_ids']:
+            if j['action'] == 'add':
+                c.execute('INSERT OR IGNORE INTO model_categories VALUES(?,?)', (mid, j['category_id']))
+            else:
+                c.execute('DELETE FROM model_categories WHERE model_id=? AND category_id=?', (mid, j['category_id']))
+    bump()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- automatisch indelen: mappen en regels
+RULE_FIELDS = ('path', 'name', 'ext')
+
+
+def _model_keys(c, ids=None):
+    """id -> (pad, naam, extensie), allemaal in kleine letters. Het pad is relatief aan de root folder, met / als scheidingsteken."""
+    roots = {r['id']: r['path'] for r in c.execute('SELECT id, path FROM roots')}
+    q = 'SELECT id, root_id, path, name, ext, container, member FROM models'
+    if ids is None:
+        rows = c.execute(q).fetchall()
+    else:
+        ids, rows = list(ids), []
+        for i in range(0, len(ids), 500):  # SQLite heeft een maximum aantal variabelen per query
+            part = ids[i:i + 500]
+            rows += c.execute(q + ' WHERE id IN (%s)' % ','.join('?' * len(part)), part).fetchall()
+    out = {}
+    for r in rows:
+        try:
+            rel = os.path.relpath(r['container'] or r['path'], roots[r['root_id']]).replace(os.sep, '/')
+        except (KeyError, ValueError):
+            rel = (r['container'] or r['path']).replace(os.sep, '/')
+        if r['container'] and r['member']:
+            rel += '/' + r['member']
+        out[r['id']] = (rel.lower(), (r['name'] or '').lower(), (r['ext'] or '').lower())
+    return out
+
+
+def _rule_hits(rule, keys):
+    v = (rule['value'] or '').strip().lower().lstrip('.') if rule['field'] == 'ext' else (rule['value'] or '').strip().lower()
+    if not v:
+        return []
+    i = {'path': 0, 'name': 1, 'ext': 2}[rule['field']]
+    return [mid for mid, k in keys.items() if (k[i] == v if rule['field'] == 'ext' else v in k[i])]
+
+
+def apply_rules(ids=None, rule_id=None):
+    """Zet de categorie van elke regel bij de modellen die erbij passen (ids=None: alle modellen). Haalt nooit iets weg. Geeft het aantal nieuwe koppelingen."""
+    with db() as c:
+        rules = c.execute('SELECT * FROM rules' + (' WHERE id=?' if rule_id else ''), (rule_id,) if rule_id else ()).fetchall()
+        if not rules:
+            return 0
+        keys = _model_keys(c, ids)
+        n = 0
+        for rl in rules:
+            for mid in _rule_hits(rl, keys):
+                n += c.execute('INSERT OR IGNORE INTO model_categories VALUES(?,?)', (mid, rl['category_id'])).rowcount
+    if n:
+        bump()
+    return n
+
+
+def _top_folder(m):
+    return m['folder'].replace(os.sep, '/').split('/')[0] if m['folder'] else ''
+
+
+@app.get('/api/folders')
+def folders_list():
+    """Mappen op het hoogste niveau van de root folders, met het aantal modellen en of er al een categorie met die naam is."""
+    models, categories = _lib_base()
+    by, loose = {}, 0
+    cat_by_name = {c['name'].lower(): c['id'] for c in categories}
+    for m in models:
+        f = _top_folder(m)
+        if not f:
+            loose += 1
+        elif not f.startswith('.'):
+            e = by.setdefault(f, dict(name=f, count=0, done=0))
+            e['count'] += 1
+            cid = cat_by_name.get(f.lower())
+            if cid and cid in m['cats']:
+                e['done'] += 1
+    items = sorted(by.values(), key=lambda x: (-x['count'], x['name'].lower()))
+    for e in items:
+        e['category_id'] = cat_by_name.get(e['name'].lower())
+    return jsonify(folders=items, loose=loose, total=len(models))
+
+
+@app.post('/api/folders/categorize')
+def folders_categorize():
+    """{items: [{folder, category}]}: maakt de categorie aan (als die nog niet bestaat) en zet alle modellen uit die map erin. Haalt nooit iets weg."""
+    items = (request.json or {}).get('items')
+    if not isinstance(items, list) or not items or len(items) > 5000:
+        return jsonify(error='Kies minstens één map'), 400
+    models, _ = _lib_base()
+    ids_by = {}
+    for m in models:
+        ids_by.setdefault(_top_folder(m), []).append(m['id'])
+    created = assigned = 0
+    with db() as c:
+        for it in items:
+            f, name = str(it.get('folder') or ''), str(it.get('category') or '').strip()
+            if not f or f not in ids_by:
+                continue
+            if not name or len(name) > 100:
+                return jsonify(error=f'Ongeldige categorienaam voor map "{f}"'), 400
+            row = c.execute('SELECT id FROM categories WHERE name=?', (name,)).fetchone()
+            if row:
+                cid = row['id']
+            else:
+                cid = c.execute('INSERT INTO categories(name) VALUES(?)', (name,)).lastrowid
+                created += 1
+            assigned += sum(c.execute('INSERT OR IGNORE INTO model_categories VALUES(?,?)', (mid, cid)).rowcount for mid in ids_by[f])
+    hist('Categorie', f'{assigned} modellen ingedeeld vanuit {len(items)} map(pen); {created} nieuwe categorie(ën)')
+    return jsonify(created=created, assigned=assigned)
+
+
+@app.get('/api/rules')
+def rules_list():
+    with db() as c:
+        rows = c.execute('SELECT r.*, c.name AS category FROM rules r JOIN categories c ON c.id=r.category_id ORDER BY r.id').fetchall()
+        keys = _model_keys(c) if rows else {}
+        have = {(r['model_id'], r['category_id']) for r in c.execute('SELECT * FROM model_categories')} if rows else set()
+    out = []
+    for r in rows:
+        hits = _rule_hits(r, keys)
+        out.append(dict(id=r['id'], field=r['field'], value=r['value'], category_id=r['category_id'], category=r['category'], matches=len(hits),
+                        todo=sum(1 for m in hits if (m, r['category_id']) not in have)))
+    return jsonify(out)
+
+
+@app.post('/api/rules')
+def rules_add():
+    j = request.json or {}
+    field, value = j.get('field'), str(j.get('value') or '').strip()
+    if field not in RULE_FIELDS:
+        return jsonify(error='Ongeldig veld voor de regel'), 400
+    if not value or len(value) > 200:
+        return jsonify(error='Vul een tekst in voor de regel (maximaal 200 tekens)'), 400
+    with db() as c:
+        if not c.execute('SELECT 1 FROM categories WHERE id=?', (j.get('category_id'),)).fetchone():
+            return jsonify(error='Kies een categorie'), 400
+        ex = c.execute('SELECT id FROM rules WHERE field=? AND value=? COLLATE NOCASE AND category_id=?', (field, value, j['category_id'])).fetchone()
+        if ex:
+            return jsonify(id=ex['id'], existing=True)
+        rid = c.execute('INSERT INTO rules(field,value,category_id,created) VALUES(?,?,?,?)', (field, value, j['category_id'], time.time())).lastrowid
+    bump()
+    return jsonify(id=rid)
+
+
+@app.delete('/api/rules/<int:rid>')
+def rules_delete(rid):
+    with db() as c:
+        c.execute('DELETE FROM rules WHERE id=?', (rid,))
+    bump()
+    return jsonify(ok=True)
+
+
+@app.post('/api/rules/apply')
+def rules_apply():
+    rid = (request.json or {}).get('id')
+    n = apply_rules(rule_id=int(rid) if rid else None)
+    if n:
+        hist('Categorie', f'Regels toegepast: {n} koppeling(en) gezet')
+    return jsonify(assigned=n)
+
+
+def roots_info():
+    out = []
+    with db() as c:
+        counts = {r['root_id']: r['n'] for r in c.execute('SELECT root_id, COUNT(*) n FROM models GROUP BY root_id')}
+        for r in c.execute('SELECT * FROM roots ORDER BY path'):
+            ok, free, total = os.path.isdir(r['path']), None, None
+            if ok:
+                try:
+                    u = shutil.disk_usage(r['path'])
+                    free, total = u.free, u.total
+                except OSError:
+                    pass
+            out.append(dict(id=r['id'], path=r['path'], watch=bool(r['watch']), allow_write=bool(r['allow_write']), ok=ok, free=free, total=total,
+                            writable=ok and os.access(r['path'], os.W_OK), count=counts.get(r['id'], 0), live=r['id'] in OBS))
+    return out
+
+
+@app.get('/api/roots')
+def roots_get():
+    return jsonify(roots_info())
+
+
+@app.post('/api/roots')
+def roots_add():
+    raw = clean_path((request.json or {}).get('path'))
+    if not raw:
+        return jsonify(error='Geen pad opgegeven'), 400
+    if os.name == 'nt' and unc_server_only(raw):
+        return jsonify(error='Geef een volledig netwerkpad op: server én share, bijvoorbeeld \\\\nas\\modellen'), 400
+    p = os.path.normpath(raw)
+    if not os.path.isdir(p):
+        return jsonify(error='Map niet gevonden. Controleer het pad en of dit Windows-account toegang heeft (bij een netwerkpad: server én share, bijvoorbeeld \\\\nas\\modellen).'
+                       if os.name == 'nt' else 'Map bestaat niet (is hij gemount in de container/LXC?)'), 400
+    if os.name != 'nt' and p == '/':
+        return jsonify(error='Dit is de hoofdmap van het systeem (/), geen modelmap. Kies de map met je modellen, bijvoorbeeld /models.'), 400
+    with db() as c:
+        known = [x['path'] for x in c.execute('SELECT path FROM roots')]
+        for x in ([] if p in known else known):  # dezelfde root nogmaals toevoegen is geen overlap
+            if _under(p, x) or _under(x, p):
+                return jsonify(error=f"Deze map overlapt met een bestaande root folder: {x}"), 400
+        c.execute('INSERT OR IGNORE INTO roots(path) VALUES(?)', (p,))
+        rid = c.execute('SELECT id FROM roots WHERE path=?', (p,)).fetchone()['id']
+    log.info('Root folder toegevoegd: %s', p)
+    sync_watchers()
+    threading.Thread(target=scan, args=(rid,), daemon=True).start()
+    return jsonify(id=rid)
+
+
+@app.put('/api/roots/<int:rid>')
+def roots_put(rid):
+    j = request.json or {}
+    with db() as c:
+        if 'watch' in j:
+            c.execute('UPDATE roots SET watch=? WHERE id=?', (1 if j['watch'] else 0, rid))
+        if 'allow_write' in j:
+            c.execute('UPDATE roots SET allow_write=? WHERE id=?', (1 if j['allow_write'] else 0, rid))
+    if 'watch' in j:
+        sync_watchers()
+    bump()
+    return jsonify(ok=True)
+
+
+@app.delete('/api/roots/<int:rid>')
+def roots_del(rid):
+    with db() as c:
+        ids = [r['id'] for r in c.execute('SELECT id FROM models WHERE root_id=?', (rid,))]
+        c.execute('DELETE FROM roots WHERE id=?', (rid,))
+    for i in ids:
+        try:
+            os.remove(os.path.join(THUMBS, f'{i}.png'))
+        except OSError:
+            pass
+    sync_watchers()
+    hist('Root verwijderd', f'Root folder verwijderd uit de bibliotheek ({len(ids)} modellen); bestanden zijn niet aangeraakt')
+    return jsonify(ok=True)
+
+
+def _under(p, root):
+    r = root.rstrip('\\/')
+    return len(p) >= len(r) and p[:len(r)].lower() == r.lower() and (len(p) == len(r) or p[len(r)] in '\\/')
+
+
+def _rebase(p, old, new):
+    """Pad onder de oude root omzetten naar het nieuwe pad, ook van Windows (\\) naar Linux (/) en terug. None = niet onder de oude root."""
+    if not _under(p, old):
+        return None
+    parts = [x for x in re.split(r'[\\/]+', p[len(old.rstrip('\\/')):]) if x]
+    return os.path.join(new, *parts) if parts else new
+
+
+def _has_data(c, ids):
+    """Hoeveel van deze modellen hebben eigen gegevens (notitie, favoriet, categorie, printlogboek, eigen thumbnail...)?"""
+    n = 0
+    for i in range(0, len(ids), 500):
+        ch = ids[i:i + 500]
+        n += c.execute("SELECT COUNT(*) FROM models WHERE id IN (%s) AND (COALESCE(notes,'')<>'' OR favorite=1 OR COALESCE(printed,'')<>'' OR COALESCE(source_url,'')<>'' "
+                       "OR COALESCE(display_name,'')<>'' OR thumb_custom=1 OR id IN (SELECT model_id FROM model_categories) OR id IN (SELECT model_id FROM prints))" % ','.join('?' * len(ch)), ch).fetchone()[0]
+    return n
+
+
+def plan_root_move(rid, raw):
+    """Bepaalt wat er gebeurt als een root folder een nieuw pad krijgt. Geeft (plan, None) of (None, (melding, statuscode))."""
+    raw = clean_path(raw)
+    if not raw:
+        return None, ('Geen pad opgegeven', 400)
+    if os.name == 'nt' and unc_server_only(raw):
+        return None, ('Geef een volledig netwerkpad op: server én share, bijvoorbeeld \\\\nas\\modellen', 400)
+    new = os.path.normpath(raw)
+    if not os.path.isdir(new):
+        return None, ('Map niet gevonden. Controleer het pad en of dit Windows-account toegang heeft.' if os.name == 'nt' else 'Map bestaat niet (is hij gemount in de container/LXC?)', 400)
+    with db() as c:
+        r = c.execute('SELECT * FROM roots WHERE id=?', (rid,)).fetchone()
+        if not r:
+            return None, ('Root folder niet gevonden', 404)
+        if new == r['path']:
+            return None, ('Dit is al het pad van deze root folder', 400)
+        roots = c.execute('SELECT * FROM roots WHERE id<>?', (rid,)).fetchall()
+        rows = c.execute('SELECT id, path, container, member FROM models WHERE root_id=?', (rid,)).fetchall()
+        others = {x['path']: (x['id'], x['root_id']) for x in c.execute('SELECT id, path, root_id FROM models WHERE root_id<>?', (rid,))}
+    target = next((x for x in roots if x['path'] == new), None)
+    for x in roots:
+        if x is not target and (_under(x['path'], new) or _under(new, x['path'])):
+            return None, (f"Het nieuwe pad overlapt met een andere root folder: {x['path']}", 400)
+    key = (lambda s: s.lower()) if os.name == 'nt' else (lambda s: s)
+    have = set()
+    for d, dirs, files in os.walk(walk_top(new), followlinks=False):
+        dirs[:] = [x for x in dirs if not x.startswith(('.', '@', '#', '$')) and x != 'System Volume Information']
+        have.update(key(os.path.join(d, f)) for f in files)
+    updates, found = [], 0
+    for m in rows:
+        if m['container']:
+            nc = _rebase(m['container'], r['path'], new)
+            np_ = f"{nc}!/{m['member']}" if nc else None
+            present = bool(nc) and key(nc) in have
+        else:
+            nc, np_ = None, _rebase(m['path'], r['path'], new)
+            present = bool(np_) and key(np_) in have
+        if np_ is None:
+            continue
+        found += present
+        updates.append((m['id'], np_, nc))
+    clash = [others[p] for _, p, _ in updates if p in others]
+    if any(x[1] != (target['id'] if target else None) for x in clash):
+        return None, ('Het nieuwe pad overlapt met modellen uit een andere root folder', 400)
+    cids = [x[0] for x in clash]
+    with db() as c:
+        with_data = _has_data(c, cids) if cids else 0
+    return dict(old_path=r['path'], new_path=new, total=len(rows), found=found, missing=len(updates) - found, conflicts=len(cids), conflict_ids=cids,
+                conflicts_with_data=with_data, merge=bool(target), target_id=target['id'] if target else None, updates=updates,
+                needs_force=bool(rows) and found * 2 < len(rows)), None
+
+
+@app.post('/api/roots/<int:rid>/move')
+def roots_move(rid):
+    """Root folder een nieuw pad geven (bijvoorbeeld van \\\\nas\\3d naar /models) terwijl modellen, categorieën, notities en thumbnails behouden blijven.
+    Zonder 'apply' alleen een overzicht van wat er zou gebeuren."""
+    j = request.json or {}
+    plan, err = plan_root_move(rid, j.get('path'))
+    if err:
+        return jsonify(error=err[0]), err[1]
+    out = {k: plan[k] for k in ('new_path', 'total', 'found', 'missing', 'conflicts', 'conflicts_with_data', 'merge', 'needs_force')}
+    if not j.get('apply'):
+        return jsonify(out)
+    if plan['needs_force'] and not j.get('force'):
+        return jsonify(error=f"Op het nieuwe pad zijn maar {plan['found']} van {plan['total']} bestanden gevonden", **out), 409
+    with db() as c:
+        if plan['conflict_ids']:  # dubbele ingangen van een eerdere scan op de nieuwe plek: de bestaande modellen met hun gegevens winnen
+            c.executemany('DELETE FROM models WHERE id=?', [(i,) for i in plan['conflict_ids']])
+        c.executemany('UPDATE models SET path=?, container=? WHERE id=?', [(p, nc, i) for i, p, nc in plan['updates']])
+        final = rid
+        if plan['merge']:
+            final = plan['target_id']
+            c.execute('UPDATE models SET root_id=? WHERE root_id=?', (final, rid))
+            c.execute('DELETE FROM roots WHERE id=?', (rid,))
+        else:
+            c.execute('UPDATE roots SET path=? WHERE id=?', (plan['new_path'], rid))
+    for i in plan['conflict_ids']:
+        try:
+            os.remove(os.path.join(THUMBS, f'{i}.png'))
+        except OSError:
+            pass
+    log.info('Root folder verplaatst: %s -> %s (%d modellen)', plan['old_path'], plan['new_path'], len(plan['updates']))
+    hist('Root verplaatst', f"{plan['old_path']} → {plan['new_path']} ({len(plan['updates'])} modellen)")
+    sync_watchers()
+    bump()
+    threading.Thread(target=scan, args=(final,), daemon=True).start()
+    return jsonify(out)
+
+
+PRINTER_PRESETS = [  # maten uit meerdere bronnen; controleer altijd de maat van je eigen printer
+    ('Bambu Lab A1 mini', 180, 180, 180), ('Bambu Lab A1', 256, 256, 256), ('Bambu Lab P1P', 256, 256, 256),
+    ('Bambu Lab P1S', 256, 256, 256), ('Bambu Lab X1 Carbon', 256, 256, 256), ('Bambu Lab P2S', 256, 256, 256),
+    ('Bambu Lab H2S', 340, 320, 340)]
+
+
+def _printer_fields(j):
+    name = (j.get('name') or '').strip()[:60]
+    try:
+        bed = [float(j[k]) for k in ('bed_x', 'bed_y', 'bed_z')]
+    except (KeyError, TypeError, ValueError):
+        return None, 'Vul de bedgrootte (X, Y en Z) in mm in'
+    if not name:
+        return None, 'Geef de printer een naam'
+    if not all(0 < v <= 5000 for v in bed):
+        return None, 'De bedgrootte moet tussen 0 en 5000 mm liggen'
+    return (name, *bed), None
+
+
+@app.get('/api/printers')
+def printers_get():
+    with db() as c:
+        return jsonify([dict(r) for r in c.execute('SELECT * FROM printers ORDER BY name COLLATE NOCASE')])
+
+
+@app.get('/api/printers/presets')
+def printers_presets():
+    return jsonify([dict(name=n, bed_x=x, bed_y=y, bed_z=z) for n, x, y, z in PRINTER_PRESETS])
+
+
+@app.post('/api/printers')
+def printers_add():
+    f, err = _printer_fields(request.json or {})
+    if err:
+        return jsonify(error=err), 400
+    try:
+        with db() as c:
+            pid = c.execute('INSERT INTO printers(name,bed_x,bed_y,bed_z) VALUES(?,?,?,?)', f).lastrowid
+    except sqlite3.IntegrityError:
+        return jsonify(error='Er bestaat al een printer met die naam'), 409
+    bump()
+    return jsonify(id=pid)
+
+
+@app.put('/api/printers/<int:pid>')
+def printers_put(pid):
+    f, err = _printer_fields(request.json or {})
+    if err:
+        return jsonify(error=err), 400
+    try:
+        with db() as c:
+            c.execute('UPDATE printers SET name=?, bed_x=?, bed_y=?, bed_z=? WHERE id=?', (*f, pid))
+    except sqlite3.IntegrityError:
+        return jsonify(error='Er bestaat al een printer met die naam'), 409
+    bump()
+    return jsonify(ok=True)
+
+
+@app.delete('/api/printers/<int:pid>')
+def printers_del(pid):
+    with db() as c:
+        c.execute('DELETE FROM printers WHERE id=?', (pid,))
+    bump()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- Spoolman + printlogboek
+def spoolman_call(path, method='GET', body=None, timeout=5):
+    base = CFG['spoolman_url'].rstrip('/')
+    if not base:
+        raise ValueError('Spoolman is niet ingesteld (Instellingen → Algemeen)')
+    rq = urllib.request.Request(base + '/api/v1' + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(rq, timeout=timeout) as x:
+            return json.loads(x.read() or b'null')
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"Spoolman antwoordde met fout {e.code}: {e.read()[:200].decode('utf-8', 'ignore')}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise ValueError(f"Spoolman is niet bereikbaar op {base}: {getattr(e, 'reason', e)}")
+
+
+@app.get('/api/spoolman/status')
+def spoolman_status():
+    if not CFG['spoolman_url']:
+        return jsonify(configured=False)
+    try:
+        return jsonify(configured=True, ok=True, version=spoolman_call('/info', timeout=3).get('version'))
+    except ValueError as e:
+        return jsonify(configured=True, ok=False, error=str(e))
+
+
+@app.get('/api/spoolman/spools')
+def spoolman_spools():
+    try:
+        spools = spoolman_call('/spool')
+    except ValueError as e:
+        return jsonify(error=str(e)), 502
+    out = []
+    for s in spools:
+        if s.get('archived'):
+            continue
+        f = s.get('filament') or {}
+        label = ' '.join(x for x in ((f.get('vendor') or {}).get('name'), f.get('name')) if x) or f"Spoel {s['id']}"
+        out.append(dict(id=s['id'], label=label, material=f.get('material') or '', color=f.get('color_hex') or '', remaining=s.get('remaining_weight')))
+    return jsonify(sorted(out, key=lambda x: x['label'].lower()))
+
+
+@app.get('/api/models/<int:mid>/prints')
+def prints_get(mid):
+    one(mid)
+    with db() as c:
+        return jsonify([dict(r) for r in c.execute('SELECT * FROM prints WHERE model_id=? ORDER BY ts DESC, id DESC', (mid,))])
+
+
+@app.post('/api/models/<int:mid>/prints')
+def prints_add(mid):
+    one(mid)
+    j = request.json or {}
+    if j.get('result') not in ('ok', 'failed'):
+        return jsonify(error='Kies of de print gelukt of mislukt is'), 400
+    try:
+        grams = float(j['grams']) if j.get('grams') not in (None, '') else None
+        ts = float(j['ts']) if j.get('ts') else time.time()
+        plate = int(j['plate']) if j.get('plate') not in (None, '') else None
+        pid = int(j['printer_id']) if j.get('printer_id') not in (None, '') else None
+        spool_id = int(j['spool_id']) if j.get('spool_id') not in (None, '') else None
+    except (TypeError, ValueError):
+        return jsonify(error='Ongeldige waarde (gewicht, datum, plaat, printer of spoel)'), 400
+    if grams is not None and not 0 <= grams <= 100000:
+        return jsonify(error='Het filamentverbruik moet tussen 0 en 100000 gram liggen'), 400
+    printer = None
+    if pid is not None:
+        with db() as c:
+            pr = c.execute('SELECT name FROM printers WHERE id=?', (pid,)).fetchone()
+        printer = pr['name'] if pr else None
+    spool = None
+    if j.get('deduct') and spool_id is not None and grams:  # verbruik aftrekken in Spoolman: eerst dat, pas daarna loggen
+        try:
+            spoolman_call(f'/spool/{spool_id}/use', 'PUT', {'use_weight': grams})
+        except ValueError as e:
+            return jsonify(error=f'Niets opgeslagen. {e}'), 502
+        spool = (str(j.get('spool') or '') or f'spoel {spool_id}')[:100]
+    else:
+        spool_id = None
+    with db() as c:
+        new = c.execute('INSERT INTO prints(model_id,ts,result,printer_id,printer,plate,grams,spool_id,spool,notes) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                        (mid, ts, j['result'], pid if printer else None, printer, plate, grams, spool_id, spool, (str(j.get('notes') or '').strip()[:1000]) or None)).lastrowid
+        if j['result'] == 'ok':
+            c.execute("UPDATE models SET printed='printed' WHERE id=?", (mid,))
+    bump()
+    return jsonify(id=new, deducted=spool is not None)
+
+
+@app.delete('/api/prints/<int:pid>')
+def prints_del(pid):
+    with db() as c:
+        c.execute('DELETE FROM prints WHERE id=?', (pid,))
+    bump()
+    return jsonify(ok=True)
+
+
+@app.get('/api/fs')
+def fs():
+    p = clean_path(request.args.get('path')) or ('' if os.name == 'nt' else '/')
+    if not p:  # Windows: lijst met stations, gekoppelde netwerkschijven met hun UNC-pad
+        return jsonify(path='', parent=None, unc=None, dirs=[dict(name=d, path=d, unc=unc_of(d)) for d in windows_drives()])
+    if os.name == 'nt' and unc_server_only(p):
+        return jsonify(error='Geef een volledig netwerkpad op: server én share, bijvoorbeeld \\\\nas\\modellen'), 400
+    p = os.path.abspath(p)
+    try:
+        skip = ('@', '#', '$') if request.args.get('hidden') == '1' else ('.', '@', '#', '$')  # hidden=1: ook mappen met een punt (bijv. .back-ups)
+        dirs = sorted(e.name for e in os.scandir(p) if e.is_dir() and not e.name.startswith(skip))
+    except OSError as e:
+        return jsonify(error=e.strerror or 'Map niet toegankelijk'), 400
+    par = os.path.dirname(p)
+    return jsonify(path=p, parent=(('' if os.name == 'nt' else None) if par == p else par), unc=unc_of(p),
+                   dirs=[dict(name=n, path=os.path.join(p, n)) for n in dirs])
+
+
+@app.get('/api/settings')
+def settings_get():
+    return jsonify(scan_interval=int(CFG['scan_interval']), min_age=int(CFG['min_age']), extensions=CFG['extensions'],
+                   thumb_size=int(CFG['thumb_size']), big_mb=int(CFG['big_mb']), recent_days=int(CFG['recent_days']), thumb_source=CFG['thumb_source'], thumb_delay=int(CFG['thumb_delay']), spoolman_url=CFG['spoolman_url'], slicer=CFG['slicer'], backup_keep=int(CFG['backup_keep']), backup_thumbs=CFG['backup_thumbs'] == '1', backup_dir=CFG['backup_dir'], backup_dir_now=backup_dir(), backup_last=T['backup']['last'], backup_error=T['backup'].get('error'), zip_support=CFG['zip_support'] == '1', api_key=CFG['api_key'],
+                   host=HOST, port=PORT, version=VERSION)
+
+
+@app.post('/api/settings')
+def settings_post():
+    j, old = request.json or {}, (CFG['thumb_size'], CFG['thumb_source'])
+    try:
+        for k, lo, hi in (('scan_interval', 1, 1440), ('min_age', 0, 3600), ('thumb_size', 128, 1024), ('big_mb', 1, 100000), ('recent_days', 1, 3650), ('thumb_delay', 0, 600), ('backup_keep', 1, 60)):
+            if k in j:
+                put(k, min(hi, max(lo, int(j[k]))))
+    except (TypeError, ValueError):
+        return jsonify(error='Ongeldige waarde'), 400
+    if 'slicer' in j:
+        if j['slicer'] not in SLICERS:
+            return jsonify(error='Onbekende slicer'), 400
+        put('slicer', j['slicer'])
+    if 'spoolman_url' in j:
+        u = (j['spoolman_url'] or '').strip().rstrip('/')
+        if u and not u.lower().startswith(('http://', 'https://')):
+            return jsonify(error='Het adres van Spoolman moet met http:// of https:// beginnen'), 400
+        put('spoolman_url', u)
+    if 'backup_thumbs' in j:
+        put('backup_thumbs', '1' if j['backup_thumbs'] else '0')
+    if 'backup_dir' in j:
+        p = str(j['backup_dir'] or '').strip()
+        if p != CFG['backup_dir']:
+            err = check_backup_dir(p, create=True) if p else ''
+            if err:
+                return jsonify(error=err), 400
+            put('backup_dir', p)
+            threading.Thread(target=backup, daemon=True).start()  # meteen een back-up: zo zie je direct dat de map werkt
+    if 'zip_support' in j and ('1' if j['zip_support'] else '0') != CFG['zip_support']:
+        put('zip_support', '1' if j['zip_support'] else '0')
+        threading.Thread(target=scan, daemon=True).start()
+    if j.get('thumb_source') in ('embedded', 'render'):
+        put('thumb_source', j['thumb_source'])
+    if (CFG['thumb_size'], CFG['thumb_source']) != old:
+        log.info('Thumbnail-instelling gewijzigd (grootte %s px, bron %s): alle thumbnails worden opnieuw gemaakt', CFG['thumb_size'], CFG['thumb_source'])
+        rebuild_thumbs()
+    if 'extensions' in j:
+        put('extensions', ','.join(x.strip().lower().lstrip('.') for x in str(j['extensions']).split(',') if x.strip()))
+    if j.get('regen_key'):
+        put('api_key', secrets.token_hex(16))
+    return jsonify(ok=True)
+
+
+@app.get('/api/queue')
+def queue():
+    with db() as c:
+        items = [dict(r) for r in c.execute("SELECT id, name, ext, added_at AS added FROM models WHERE thumb_status='pending' ORDER BY id LIMIT 100")]
+        n = c.execute("SELECT COUNT(*) FROM models WHERE thumb_status='pending'").fetchone()[0]
+        f = c.execute("SELECT COUNT(*) FROM models WHERE thumb_status='failed'").fetchone()[0]
+    cur = dict(CUR)
+    return jsonify(current=dict(name=cur['name'], secs=int(time.time() - cur['started'])) if cur else None,
+                   pending=n, failed=f, paused=CFG['thumb_paused'] == '1', items=[i for i in items if i['id'] != cur.get('id')])
+
+
+@app.post('/api/queue/pause')
+def queue_pause():
+    put('thumb_paused', '1' if (request.json or {}).get('paused') else '0')
+    bump()
+    return jsonify(ok=True)
+
+
+@app.get('/api/history')
+def history():
+    with db() as c:
+        return jsonify([dict(r) for r in c.execute('SELECT * FROM history ORDER BY id DESC LIMIT 300')])
+
+
+@app.get('/api/wanted')
+def wanted():
+    with db() as c:
+        items = [dict(id=r['id'], name=r['name'], ext=r['ext'], path=r['path'], status=r['thumb_status'], error=r['thumb_error'] or 'Onbekende fout')
+                 for r in c.execute("SELECT * FROM models WHERE thumb_status='failed' ORDER BY name")]
+        n = c.execute("SELECT COUNT(*) FROM models WHERE thumb_status='unsupported'").fetchone()[0]
+    return jsonify(items=items, unsupported=n)
+
+
+@app.post('/api/wanted/retry')
+def wanted_retry():
+    ids = (request.json or {}).get('ids')
+    with db() as c:
+        if ids:
+            c.executemany("UPDATE models SET thumb_status='pending', thumb_error=NULL WHERE thumb_status='failed' AND id=?", [(int(i),) for i in ids])
+        else:
+            c.execute("UPDATE models SET thumb_status='pending', thumb_error=NULL WHERE thumb_status='failed'")
+    bump()
+    return jsonify(ok=True)
+
+
+@app.get('/api/tasks')
+def tasks():
+    iv = max(1, int(CFG['scan_interval']))
+    return jsonify([
+        dict(key='scan', name='Bibliotheek scannen', interval=f'{iv} min', running=T['scan']['running'], last=T['scan']['last'],
+             next=NEXT['scan'] or None, dur=T['scan']['dur'],
+             desc='Zoekt nieuwe, gewijzigde, verplaatste en verwijderde bestanden in alle root folders (naast de live bestandswachter).'),
+        dict(key='rebuild', name='Alle thumbnails opnieuw maken', interval='handmatig', running=False, last=T['rebuild']['last'],
+             next=None, dur=None, desc='Zet alle modellen terug in de thumbnail-wachtrij (gebeurt ook automatisch bij een andere thumbnail-grootte).'),
+        dict(key='backup', name='Database back-up', interval=f"24 uur (bewaart {CFG['backup_keep']})", running=False, last=T['backup']['last'], next=NEXT['backup'],
+             dur=T['backup']['dur'], dir=backup_dir(), error=T['backup'].get('error'),
+             desc='Kopie van library.db (en optioneel de thumbnails) in de back-upmap. De map stel je in bij Instellingen → Mediabeheer. Terugzetten: stop de app en kopieer een back-up terug als library.db.'),
+        dict(key='thumbcheck', name='Thumbnails controleren', interval='bij opstarten en na elke scan', running=False, last=T['thumbcheck']['last'], next=None, dur=None,
+             desc='Controleert of elke thumbnail bestaat en bij het juiste model hoort (bijv. na het terugzetten van een back-up) en laat ontbrekende of verkeerde thumbnails opnieuw maken.')])
+
+
+@app.post('/api/tasks/<key>/run')
+def task_run(key):
+    if key == 'scan':
+        threading.Thread(target=scan, daemon=True).start()
+    elif key == 'rebuild':
+        rebuild_thumbs()
+    elif key == 'backup':
+        threading.Thread(target=backup, daemon=True).start()
+    elif key == 'thumbcheck':
+        threading.Thread(target=lambda: check_thumbs(True), daemon=True).start()
+    else:
+        abort(404)
+    return jsonify(ok=True)
+
+
+@app.get('/api/logs')
+def logs():
+    order = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+    lvl = order.index(request.args.get('level', 'INFO').upper()) if request.args.get('level', 'INFO').upper() in order else 1
+    return jsonify([l for l in reversed(LOGS) if order.index(l['level']) >= lvl][:500])
+
+
+@app.delete('/api/logs')
+def logs_clear():
+    LOGS.clear()
+    return jsonify(ok=True)
+
+
+@app.get('/api/status')
+def status():
+    roots, health = roots_info(), []
+    with db() as c:
+        counts = {k: c.execute(q).fetchone()[0] for k, q in dict(
+            models='SELECT COUNT(*) FROM models', categories='SELECT COUNT(*) FROM categories',
+            failed="SELECT COUNT(*) FROM models WHERE thumb_status='failed'",
+            unsupported="SELECT COUNT(*) FROM models WHERE thumb_status='unsupported'").items()}
+    if not roots:
+        health.append(dict(level='warning', msg='Geen root folder ingesteld. Voeg er een toe onder Instellingen → Mediabeheer (of zet MODELS_DIR).'))
+    if os.name != 'nt' and any(r['path'] == '/' for r in roots):
+        health.append(dict(level='error', msg='Een root folder is de hoofdmap (/) van de container: daar worden ook systeembestanden gescand. Verwijder deze root en voeg je modelmap toe (bijvoorbeeld /models).'))
+    for a in roots:
+        for b in roots:
+            if a['path'] != b['path'] and _under(a['path'], b['path']):
+                health.append(dict(level='warning', msg=f"Root folders overlappen: {a['path']} ligt in {b['path']}. Bestanden worden maar één keer opgenomen; verwijder een van beide onder Instellingen → Mediabeheer."))
+    for r in roots:
+        if not r['ok']:
+            health.append(dict(level='error', msg=f"Root folder niet bereikbaar: {r['path']} (mount offline of verkeerd pad?)"))
+        elif not r['writable']:
+            health.append(dict(level='info', msg=f"Root folder is alleen-lezen: {r['path']} (bestanden hernoemen is niet mogelijk)"))
+        elif r['watch'] and not r['live']:
+            health.append(dict(level='info', msg=f"Geen live bestandswachter voor {r['path']}; er wordt gescand elke {CFG['scan_interval']} min."))
+    if CFG['spoolman_url']:
+        try:
+            spoolman_call('/info', timeout=2)
+        except ValueError as e:
+            health.append(dict(level='warning', msg=str(e)))
+    net = config_on_network()
+    if net:
+        health.append(dict(level='warning', msg=f'De config-map met de database ({CONFIG}) staat op een netwerkshare ({net}). SQLite is daar onbetrouwbaar en kan beschadigd raken: gebruik lokale opslag.'))
+    if not AUTH_ON[0]:
+        health.append(dict(level='warning', msg='Er zijn geen accounts: iedereen op je netwerk kan bestanden zien en hernoemen. Maak een beheerdersaccount aan onder Instellingen → Gebruikers.'))
+    if counts['failed']:
+        health.append(dict(level='warning', msg=f"{counts['failed']} thumbnail(s) mislukt, zie Gewenst."))
+    if counts['unsupported']:
+        health.append(dict(level='info', msg=f"{counts['unsupported']} model(len) in een formaat zonder preview-ondersteuning."))
+    return jsonify(version=VERSION, python=platform.python_version(), platform=platform.platform(), uptime=time.time() - START,
+                   config=CONFIG, db_size=os.path.getsize(DB), roots=roots, health=health, **counts)
+
+
+# ---------------------------------------------------------------- opstarten
+def main():
+    t_start = time.time()
+    init()
+    log.info('Database gereed (%.1fs)', time.time() - t_start)
+    shutil.rmtree(os.path.join(CONFIG, 'tmp'), ignore_errors=True)
+    shutil.rmtree(os.path.join(CONFIG, 'open'), ignore_errors=True)
+    for d in filter(None, (x.strip() for x in os.environ.get('MODELS_DIR', '').split(','))):
+        with db() as c:
+            c.execute('INSERT OR IGNORE INTO roots(path) VALUES(?)', (os.path.normpath(d),))
+            if os.environ.get('ALLOW_ORGANIZE') == '1':
+                c.execute('UPDATE roots SET allow_write=1 WHERE path=?', (os.path.normpath(d),))
+    bootstrap_env_admin()
+    if not CFG['api_key']:
+        put('api_key', secrets.token_hex(16))
+    with socket.socket() as sk:
+        if sk.connect_ex(('127.0.0.1', PORT)) == 0:
+            sys.exit(f'Poort {PORT} is al in gebruik. Kies een andere met de omgevingsvariabele PORT.')
+    log.info('Modelarr %s start op %s:%s (config: %s)', VERSION, HOST, PORT, CONFIG)
+    net = config_on_network()
+    if net:
+        log.warning('De config-map staat op een netwerkshare (%s): SQLite is daar onbetrouwbaar. Gebruik lokale opslag voor %s', net, CONFIG)
+    nw = max(1, min(8, int(os.environ.get('THUMB_WORKERS', '1') or 1)))  # meer workers = sneller op een NAS met meerdere cores (let op het geheugen)
+    for i in range(nw):
+        threading.Thread(target=worker, args=(i == 0,), daemon=True).start()
+    threading.Thread(target=scheduler, daemon=True).start()
+    if nw > 1:
+        log.info('%d thumbnail-workers actief', nw)
+    sync_watchers()
+    log.info('Webserver start op poort %s (%.1fs na het opstarten)', PORT, time.time() - t_start)
+    if os.environ.get('OPEN_BROWSER') == '1':  # handig op Windows
+        import webbrowser
+        threading.Timer(1.5, lambda: webbrowser.open(f'http://127.0.0.1:{PORT}')).start()
+    from waitress import serve
+    serve(app, host=HOST, port=PORT, threads=8, ident='modelarr')
+
+
+if __name__ == '__main__':
+    main()
