@@ -1,6 +1,6 @@
 # Modelarr (server version)
 
-> This app was built with the help of [Claude](https://claude.ai) (Anthropic).
+> This app was built with the help of [Claude](https://claude.ai) (Anthropic). Yes, I vibecoded it. (Is that a good word?)
 
 > This is the English version of the documentation. The Dutch original is [README.md](README.md); if the two ever differ, the Dutch one is leading. The app itself can be switched to English with the **EN** button at the bottom left of the navigation.
 
