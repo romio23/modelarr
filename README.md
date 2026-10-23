@@ -1,6 +1,6 @@
 # Modelarr (server-versie)
 
-> Deze app is gemaakt met behulp van [Claude](https://claude.ai) (Anthropic).
+> Deze app is gemaakt met behulp van [Claude](https://claude.ai) (Anthropic). Ja, via vibecode. 
 
 > English documentation: [README-EN.md](README-EN.md)
 
