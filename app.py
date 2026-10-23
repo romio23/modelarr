@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import render
 from PIL import Image
 
-VERSION = '1.2.2'
+VERSION = '1.3.1'
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.abspath(os.environ.get('CONFIG_DIR', os.path.join(BASE, 'config')))
 BACKUP_ENV = os.environ.get('BACKUP_DIR', '').strip()  # standaard back-upmap (de instelling in de app gaat voor)
@@ -113,6 +113,9 @@ def init():
             c.execute('ALTER TABLE roots ADD COLUMN allow_write INTEGER DEFAULT 0')  # hernoemen/verplaatsen toestaan
         if 'email' not in {r[1] for r in c.execute('PRAGMA table_info(users)')}:
             c.execute('ALTER TABLE users ADD COLUMN email TEXT')
+        if 'can_upload' not in {r[1] for r in c.execute('PRAGMA table_info(users)')}:
+            c.execute('ALTER TABLE users ADD COLUMN can_upload INTEGER DEFAULT 0')  # gast met toestemming om modellen te uploaden
+        c.execute('CREATE TABLE IF NOT EXISTS upload_cats(path TEXT, category_id INTEGER, ts REAL, PRIMARY KEY(path, category_id))')  # gekozen categorieën, toe te passen zodra de scan het model ziet
         c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE) WHERE email IS NOT NULL')
         # 3MF-info met onleesbare HTML-entiteiten (oudere versie) opnieuw laten lezen
         c.execute("UPDATE models SET info=NULL WHERE ext='3mf' AND (info LIKE '%&lt;%' OR info LIKE '%&gt;%' OR info LIKE '%&amp;%' OR info LIKE '%&#%' OR info LIKE '%&quot;%')")
@@ -511,6 +514,10 @@ def _scan_root(r, allowed, min_age):
         hist(*e_)
     new_ids = [e_[2] for e_ in ev if e_[0] == 'Toegevoegd' and e_[2]]
     if new_ids:
+        try:
+            apply_upload_cats(new_ids)
+        except Exception as ex:
+            log.warning('Categorieën van uploads toepassen mislukt: %s', ex)
         try:
             n = apply_rules(new_ids)
             if n:
@@ -1040,7 +1047,7 @@ def current_user():
     """(gebruiker, via): via API-sleutel, sessiecookie of Basic-authenticatie. (None, None) zonder geldige inlog."""
     key = request.headers.get('X-Api-Key')
     if key and CFG['api_key'] and hmac.compare_digest(key.encode(), CFG['api_key'].encode()):
-        return dict(id=0, username='api', role='admin', can_download=1), 'key'
+        return dict(id=0, username='api', role='admin', can_download=1, can_upload=1), 'key'
     if session.get('uid'):
         with db() as c:
             r = c.execute('SELECT * FROM users WHERE id=? AND active=1', (session['uid'],)).fetchone()
@@ -1068,6 +1075,8 @@ def viewer_ok(user):
             return True
         if m == 'POST' and re.fullmatch(r'/api/models/\d+/link', p):
             return True
+    if user.get('can_upload') and ((m == 'GET' and p in ('/api/upload/targets', '/api/upload/dirs')) or (m == 'POST' and p == '/api/upload')):
+        return True
     return m == 'POST' and p == '/api/logout'
 
 
@@ -1078,7 +1087,7 @@ def guard():
     if p in OPEN_PATHS or p.startswith('/dl/') or p.startswith('/static/'):  # /dl/: de ondertekende link is zelf de toegang
         return
     if not AUTH_ON[0]:  # nog geen accounts: iedereen is beheerder (de app waarschuwt hiervoor)
-        g.user, g.via = dict(id=0, username='', role='admin', can_download=1), 'open'
+        g.user, g.via = dict(id=0, username='', role='admin', can_download=1, can_upload=1), 'open'
         return
     user, via = current_user()
     if user is None:
@@ -1092,10 +1101,10 @@ def guard():
 
 def me_payload(u):
     if not AUTH_ON[0]:
-        return dict(auth=False, user=None, role='admin', can_download=True)
+        return dict(auth=False, user=None, role='admin', can_download=True, can_upload=True)
     if not u:
-        return dict(auth=True, user=None, role=None, can_download=False)
-    return dict(auth=True, user=u['username'], role=u['role'], can_download=bool(u['can_download']))
+        return dict(auth=True, user=None, role=None, can_download=False, can_upload=False)
+    return dict(auth=True, user=u['username'], role=u['role'], can_download=bool(u['can_download']), can_upload=u['role'] == 'admin' or bool(u.get('can_upload')))
 
 
 @app.get('/api/me')
@@ -1137,7 +1146,7 @@ def logout():
 @app.get('/api/users')
 def users_get():
     with db() as c:
-        rows = [dict(id=r['id'], username=r['username'], email=r['email'] or '', role=r['role'], can_download=bool(r['can_download']), active=bool(r['active']),
+        rows = [dict(id=r['id'], username=r['username'], email=r['email'] or '', role=r['role'], can_download=bool(r['can_download']), can_upload=bool(r['can_upload']), active=bool(r['active']),
                      created=r['created'], last_login=r['last_login'], me=bool(g.user and r['id'] == g.user['id']))
                 for r in c.execute('SELECT * FROM users ORDER BY username COLLATE NOCASE')]
     return jsonify(rows)
@@ -1162,8 +1171,8 @@ def users_add():
                 return jsonify(error='Er bestaat al een gebruiker met die naam'), 409
             if email and c.execute('SELECT 1 FROM users WHERE email=? COLLATE NOCASE', (email,)).fetchone():
                 return jsonify(error='Dit e-mailadres is al in gebruik'), 409
-            uid = c.execute('INSERT INTO users(username, pw_hash, role, can_download, created, email) VALUES(?,?,?,?,?,?)',
-                            (name, generate_password_hash(pw), role, 1 if j.get('can_download', True) else 0, time.time(), email)).lastrowid
+            uid = c.execute('INSERT INTO users(username, pw_hash, role, can_download, created, email, can_upload) VALUES(?,?,?,?,?,?,?)',
+                            (name, generate_password_hash(pw), role, 1 if j.get('can_download', True) else 0, time.time(), email, 1 if j.get('can_upload') else 0)).lastrowid
     except sqlite3.IntegrityError:
         return jsonify(error='Er bestaat al een gebruiker met die naam of dat e-mailadres'), 409
     refresh_auth()
@@ -1185,6 +1194,7 @@ def users_put(uid):
         role = j.get('role', u['role'])
         active = 1 if j.get('active', bool(u['active'])) else 0
         dl = 1 if j.get('can_download', bool(u['can_download'])) else 0
+        up = 1 if j.get('can_upload', bool(u['can_upload'])) else 0
         email = u['email']
         if 'email' in j:
             email, err = parse_email(j['email'])
@@ -1204,7 +1214,7 @@ def users_put(uid):
             pw_hash, ver = generate_password_hash(str(j['password'])), ver + 1
         if u['active'] and not active:
             ver += 1  # lopende sessies ongeldig maken
-        c.execute('UPDATE users SET role=?, active=?, can_download=?, pw_hash=?, ver=?, email=? WHERE id=?', (role, active, dl, pw_hash, ver, email, uid))
+        c.execute('UPDATE users SET role=?, active=?, can_download=?, can_upload=?, pw_hash=?, ver=?, email=? WHERE id=?', (role, active, dl, up, pw_hash, ver, email, uid))
     OKAUTH.clear()
     if g.via == 'session' and g.user['id'] == uid and active:
         session['ver'] = ver  # de eigen sessie blijft geldig na het wijzigen van je eigen wachtwoord
@@ -2161,6 +2171,163 @@ def roots_move(rid):
     bump()
     threading.Thread(target=scan, args=(final,), daemon=True).start()
     return jsonify(out)
+
+
+# ---------------------------------------------------------------- uploaden (beheerders en gasten met toestemming)
+UPLOAD_BAD = set('\\/:*?"<>|\x00') | {chr(i) for i in range(32)}
+UPLOAD_HIDDEN = ('.', '@', '#', '$')  # zulke mappen worden niet gescand
+
+
+def apply_upload_cats(ids):
+    """Categorieën die bij het uploaden zijn gekozen toepassen zodra de scan het nieuwe model heeft toegevoegd."""
+    with db() as c:
+        c.execute('DELETE FROM upload_cats WHERE ts<?', (time.time() - 7 * 86400,))
+        if not c.execute('SELECT 1 FROM upload_cats LIMIT 1').fetchone():
+            return
+        for i in range(0, len(ids), 500):
+            ch = ids[i:i + 500]
+            for m in c.execute('SELECT id, path FROM models WHERE id IN (%s)' % ','.join('?' * len(ch)), ch).fetchall():
+                for u in c.execute('SELECT category_id FROM upload_cats WHERE path=?', (m['path'],)).fetchall():
+                    c.execute('INSERT OR IGNORE INTO model_categories SELECT ?, id FROM categories WHERE id=?', (m['id'], u['category_id']))
+                c.execute('DELETE FROM upload_cats WHERE path=?', (m['path'],))
+    bump()
+
+
+def upload_name(s, what='Bestandsnaam'):
+    """Veilige naam voor één bestand of map: geen paden, geen vreemde tekens, niet verborgen."""
+    s = ''.join('_' if ch in UPLOAD_BAD else ch for ch in str(s or '')).strip().strip('.').strip()
+    return s[:150]
+
+
+def upload_root(rid):
+    with db() as c:
+        r = c.execute('SELECT * FROM roots WHERE id=?', (rid,)).fetchone()
+    if not r or not os.path.isdir(r['path']):
+        return None, ('Root folder niet gevonden of niet bereikbaar', 404)
+    if not os.access(r['path'], os.W_OK):
+        return None, ('Deze root folder is alleen-lezen (niet beschrijfbaar)', 400)
+    return dict(r), None
+
+
+def upload_dir(root, rel, create=False):
+    """(absoluut pad, fout) voor een relatieve submap binnen de root folder. Nooit buiten de root, geen verborgen mappen."""
+    parts = [x for x in re.split(r'[\\/]+', str(rel or '').strip()) if x]
+    if len(parts) > 8:
+        return None, 'Te veel mappen diep'
+    clean = []
+    for x in parts:
+        if x in ('.', '..') or x.startswith(UPLOAD_HIDDEN) or x != upload_name(x) or x == 'System Volume Information':
+            return None, f'Ongeldige mapnaam: {x}'
+        clean.append(x)
+    base = os.path.realpath(root['path'])
+    d = os.path.join(root['path'], *clean)
+    rp = os.path.realpath(d)
+    if rp != base and not rp.startswith(base.rstrip(os.sep) + os.sep):
+        return None, 'Map ligt buiten de root folder'
+    if not os.path.isdir(d):
+        if not create:
+            return None, 'Map bestaat niet'
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            return None, e.strerror or 'Map aanmaken mislukt'
+    return d, None
+
+
+@app.get('/api/upload/targets')
+def upload_targets():
+    """Root folders waar je naartoe kunt uploaden: alleen de mapnaam, nooit het pad op de schijf."""
+    out = []
+    with db() as c:
+        for r in c.execute('SELECT * FROM roots ORDER BY path'):
+            if os.path.isdir(r['path']) and os.access(r['path'], os.W_OK):
+                n = os.path.basename(r['path'].rstrip('/\\')) or r['path']
+                out.append(dict(id=r['id'], name=n))
+    return jsonify(roots=out, exts=sorted(e[1:] for e in exts()) + (['zip'] if CFG['zip_support'] == '1' else []), max_mb=MAX_MB)
+
+
+@app.get('/api/upload/dirs')
+def upload_dirs():
+    root, err = upload_root(request.args.get('root', type=int))
+    if err:
+        return jsonify(error=err[0]), err[1]
+    d, e = upload_dir(root, request.args.get('path'))
+    if e:
+        return jsonify(error=e), 400
+    try:
+        dirs = sorted((x.name for x in os.scandir(d) if x.is_dir() and not x.name.startswith(UPLOAD_HIDDEN) and x.name != 'System Volume Information'), key=str.lower)
+    except OSError as ex:
+        return jsonify(error=ex.strerror or 'Map niet toegankelijk'), 400
+    return jsonify(dirs=dirs)
+
+
+@app.post('/api/upload')
+def upload_post():
+    """Eén bestand uploaden naar een map in een root folder en meteen categorieën kiezen. Overschrijft nooit iets: bij dezelfde naam komt er (2) achter."""
+    request.max_content_length = (MAX_MB + 2) * 2 ** 20
+    root, err = upload_root(request.form.get('root', type=int))
+    if err:
+        return jsonify(error=err[0]), err[1]
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify(error='Geen bestand ontvangen'), 400
+    fname = upload_name(os.path.basename(str(f.filename).replace('\\', '/')))
+    stem, ext = os.path.splitext(fname)
+    ok = exts() | ({'.zip'} if CFG['zip_support'] == '1' else set())
+    if not stem or ext.lower() not in ok:
+        return jsonify(error=f'Bestandstype niet toegestaan ({ext or "geen extensie"}). Toegestaan: ' + ', '.join(sorted(x[1:] for x in ok))), 400
+    cats = []
+    for x in str(request.form.get('categories') or '').split(','):
+        if x.strip().isdigit():
+            cats.append(int(x))
+    if cats:
+        with db() as c:
+            have = {r[0] for r in c.execute('SELECT id FROM categories')}
+        if any(x not in have for x in cats):
+            return jsonify(error='Categorie bestaat niet meer'), 400
+    d, e = upload_dir(root, request.form.get('folder'), create=True)
+    if e:
+        return jsonify(error=e), 400
+    final, n = os.path.join(d, fname), 1
+    while os.path.exists(final):
+        n += 1
+        final = os.path.join(d, f'{stem} ({n}){ext}')
+    tmp = os.path.join(d, f'.upload-{secrets.token_hex(6)}.part')
+    try:
+        f.save(tmp)
+        size = os.path.getsize(tmp)
+        if size == 0:
+            raise ValueError('Het bestand is leeg')
+        if size > MAX_MB * 2 ** 20:
+            raise ValueError(f'Bestand groter dan {MAX_MB} MB (MAX_FILE_MB)')
+        if not os.path.exists(final):
+            os.replace(tmp, final)
+        else:  # tussendoor bezet geraakt
+            final = os.path.join(d, f'{stem} ({n + 1}){ext}')
+            os.replace(tmp, final)
+    except ValueError as ex:
+        _rm(tmp)
+        return jsonify(error=str(ex)), 413
+    except OSError as ex:
+        _rm(tmp)
+        return jsonify(error=ex.strerror or 'Opslaan mislukt'), 500
+    if cats:
+        with db() as c:
+            for x in cats:
+                c.execute('INSERT OR REPLACE INTO upload_cats VALUES(?,?,?)', (os.path.join(root['path'], os.path.relpath(final, root['path'])), x, time.time()))
+    who = g.user['username'] if g.get('user') and g.user.get('username') else 'iemand'
+    rel = os.path.relpath(final, root['path']).replace(os.sep, '/')
+    hist('Upload', f'{who} uploadde {os.path.basename(final)} naar {rel}')
+    log.info('Upload: %s door %s (%d bytes)', rel, who, size)
+    NEXT['soon'] = time.time() + max(0, int(CFG['min_age'])) + 1  # de scan neemt het bestand over zodra het "rustig" is
+    return jsonify(ok=True, name=os.path.basename(final), renamed=os.path.basename(final) != fname)
+
+
+def _rm(p):
+    try:
+        os.remove(p)
+    except OSError:
+        pass
 
 
 PRINTER_PRESETS = [  # maten uit meerdere bronnen; controleer altijd de maat van je eigen printer

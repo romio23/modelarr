@@ -26,7 +26,7 @@ const dimTxt = m => {
 const ICON_EXT = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>';
 const linkify = s => esc(s).replace(/(https?:\/\/[^\s<)]+)/g, u => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
 const tbl = (head, rows) => `<table><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr>${rows.join('')}</table>`;
-let ME = {auth: false, user: null, role: 'admin', can_download: true}, inAuto = false, onRev = null, stopFn = null, lastRev = null, openId = null, reloadLib = null, vw = null;
+let ME = {auth: false, user: null, role: 'admin', can_download: true, can_upload: true}, inAuto = false, onRev = null, stopFn = null, lastRev = null, openId = null, reloadLib = null, vw = null;
 const adm = () => ME.role === 'admin';
 
 // ------------------------------------------------------------ navigatie
@@ -163,7 +163,7 @@ function draw() {
 }
 V.library = async () => {
   $('#title').textContent = 'Bibliotheek';
-  $('#tools').innerHTML = `<input id="q" placeholder="Zoeken… (bijv. rack ext:3mf cat:server map:lab)" title="Zoekt in naam, weergavenaam, categorie, extensie, map en 3MF-info. Prefixen: naam: ext: cat: map: ontwerper: notitie: bron:. Gebruik &quot;aanhalingstekens&quot; voor zinnen." value="${esc(L.q)}" style="width:310px"><select id="fc"></select><select id="fe"></select><select id="ff"></select><select id="fs"><option value="name">Sorteer: naam</option><option value="added">Sorteer: toegevoegd</option><option value="size">Sorteer: grootte</option></select><span id="cnt" class="dim"></span><button id="vws"></button>${adm() ? '<button id="upd" class="p">↻ Bijwerken</button>' : ''}`;
+  $('#tools').innerHTML = `<input id="q" placeholder="Zoeken… (bijv. rack ext:3mf cat:server map:lab)" title="Zoekt in naam, weergavenaam, categorie, extensie, map en 3MF-info. Prefixen: naam: ext: cat: map: ontwerper: notitie: bron:. Gebruik &quot;aanhalingstekens&quot; voor zinnen." value="${esc(L.q)}" style="width:310px"><select id="fc"></select><select id="fe"></select><select id="ff"></select><select id="fs"><option value="name">Sorteer: naam</option><option value="added">Sorteer: toegevoegd</option><option value="size">Sorteer: grootte</option></select><span id="cnt" class="dim"></span><button id="vws"></button>${adm() ? '<button id="upd" class="p">↻ Bijwerken</button>' : ''}${ME.can_upload ? '<button id="upl" title="Modellen uploaden naar een map en categorie kiezen">⬆ Uploaden</button>' : ''}`;
   $('#view').innerHTML = '<div id="bulk"></div><div class="pager" id="pg1"></div><div id="items"></div><div class="pager" id="pg2"></div>';
   const sync = () => $('#vws').textContent = L.view === 'posters' ? '☰ Tabel' : '▦ Posters';
   sync(); $('#fs').value = L.sort;
@@ -173,6 +173,7 @@ V.library = async () => {
   $('#ff').onchange = e => { L.flt = e.target.value; if (L.flt === 'recent') L.sort = 'added'; if (L.flt === 'big') L.sort = 'size'; $('#fs').value = L.sort; L.page = 0; load(); };
   $('#fs').onchange = e => { L.sort = e.target.value; L.page = 0; load(); };
   $('#vws').onclick = () => { L.view = L.view === 'posters' ? 'table' : 'posters'; localStorage.setItem('view', L.view); sync(); draw(); };
+  if ($('#upl')) $('#upl').onclick = run(async () => openUpload(L.d.categories));
   if ($('#upd')) $('#upd').onclick = run(async () => { await api('/api/tasks/scan/run', 'POST'); toast('Scan gestart', 'info'); });
   const load = run(async () => {
     const my = ++libSeq, d = await api(libURL()), pr = await api('/api/printers');
@@ -764,27 +765,27 @@ V['settings/users'] = async () => {
   $('#title').textContent = 'Instellingen — Gebruikers';
   const load = run(async () => {
     const us = await api('/api/users');
-    $('#view').innerHTML = (us.length ? '<p class="dim">Beheerders mogen alles. Een gast ("kijker") kan de bibliotheek bekijken en, als je dat toestaat, modellen downloaden en in de slicer openen. Een gast kan niets wijzigen en ziet geen notities, logboek of bestandspaden op je schijf. Downloads van gasten komen in Activiteit → Geschiedenis.</p>'
+    $('#view').innerHTML = (us.length ? '<p class="dim">Beheerders mogen alles. Een gast ("kijker") kan de bibliotheek bekijken en, als je dat toestaat, modellen downloaden en in de slicer openen. Met de optie Uploaden mag een gast ook nieuwe modellen uploaden (naar een map en categorie naar keuze); beheerders mogen dat altijd. Een gast kan verder niets wijzigen en ziet geen notities, logboek of bestandspaden op je schijf. Downloads van gasten komen in Activiteit → Geschiedenis.</p>'
         : '<p class="warn">Er zijn nog geen accounts: iedereen met toegang tot dit adres kan alles. Maak hieronder je eigen beheerdersaccount aan; daarna moet iedereen inloggen.</p>')
-      + (us.length ? tbl(['Gebruiker', 'E-mail', 'Rol', 'Downloaden', 'Actief', 'Laatste login', ''], us.map(u => `<tr><td>${esc(u.username)}${u.me ? ' <span class="dim">(jij)</span>' : ''}</td><td class="dim">${esc(u.email) || '–'}</td>
+      + (us.length ? tbl(['Gebruiker', 'E-mail', 'Rol', 'Downloaden', 'Uploaden', 'Actief', 'Laatste login', ''], us.map(u => `<tr><td>${esc(u.username)}${u.me ? ' <span class="dim">(jij)</span>' : ''}</td><td class="dim">${esc(u.email) || '–'}</td>
         <td><select data-role="${u.id}"><option value="admin" ${u.role === 'admin' ? 'selected' : ''}>Beheerder</option><option value="viewer" ${u.role === 'viewer' ? 'selected' : ''}>Gast (kijker)</option></select></td>
-        <td><input type="checkbox" data-dl="${u.id}" ${u.can_download ? 'checked' : ''}></td><td><input type="checkbox" data-act="${u.id}" ${u.active ? 'checked' : ''}></td><td class="dim">${fdate(u.last_login)}</td>
+        <td><input type="checkbox" data-dl="${u.id}" ${u.can_download ? 'checked' : ''}></td><td>${u.role === 'admin' ? '<span class="dim">altijd</span>' : `<input type="checkbox" data-up="${u.id}" ${u.can_upload ? 'checked' : ''}>`}</td><td><input type="checkbox" data-act="${u.id}" ${u.active ? 'checked' : ''}></td><td class="dim">${fdate(u.last_login)}</td>
         <td><button data-em="${u.id}" data-n="${esc(u.username)}" data-v="${esc(u.email)}">E-mail</button> <button data-pw="${u.id}" data-n="${esc(u.username)}">Wachtwoord</button> <button class="d" data-del="${u.id}" data-n="${esc(u.username)}">Verwijderen</button></td></tr>`)) : '')
-      + `<h3>${us.length ? 'Gebruiker toevoegen' : 'Eerste beheerder aanmaken'}</h3><div class="row" style="max-width:860px;flex-wrap:wrap"><input id="nu" placeholder="Gebruikersnaam" autocomplete="off"><input id="ne" type="email" placeholder="E-mailadres (optioneel)" autocomplete="off"><input id="np" type="password" placeholder="Wachtwoord (minstens 8 tekens)" autocomplete="new-password">${us.length ? '<select id="nr" style="flex:0 0 auto"><option value="viewer">Gast (kijker)</option><option value="admin">Beheerder</option></select><label style="white-space:nowrap"><input type="checkbox" id="nd" checked> mag downloaden</label>' : ''}<button class="p" id="na">${us.length ? 'Toevoegen' : 'Account aanmaken'}</button></div>`
+      + `<h3>${us.length ? 'Gebruiker toevoegen' : 'Eerste beheerder aanmaken'}</h3><div class="row" style="max-width:860px;flex-wrap:wrap"><input id="nu" placeholder="Gebruikersnaam" autocomplete="off"><input id="ne" type="email" placeholder="E-mailadres (optioneel)" autocomplete="off"><input id="np" type="password" placeholder="Wachtwoord (minstens 8 tekens)" autocomplete="new-password">${us.length ? '<select id="nr" style="flex:0 0 auto"><option value="viewer">Gast (kijker)</option><option value="admin">Beheerder</option></select><label style="white-space:nowrap"><input type="checkbox" id="nd" checked> mag downloaden</label><label style="white-space:nowrap"><input type="checkbox" id="nu2"> mag uploaden</label>' : ''}<button class="p" id="na">${us.length ? 'Toevoegen' : 'Account aanmaken'}</button></div>`
       + (us.length ? '<h3>Inloggen uitzetten</h3><p class="dim">Verwijdert alle accounts; daarna heeft iedereen met toegang tot dit adres weer alle rechten.</p><button class="d" id="nclear">Alle accounts verwijderen</button>' : '')
       + '<p class="dim" style="margin-top:24px">Zet de app niet rechtstreeks op internet: gebruik daarvoor HTTPS, bijvoorbeeld via de reverse proxy van je NAS. Wachtwoorden worden versleuteld opgeslagen; na 5 foute pogingen is inloggen 10 minuten geblokkeerd.</p>';
   });
   $('#view').onchange = run(async e => {
-    const t = e.target, body = t.dataset.role ? {role: t.value} : t.dataset.dl ? {can_download: t.checked} : t.dataset.act ? {active: t.checked} : null;
+    const t = e.target, body = t.dataset.role ? {role: t.value} : t.dataset.dl ? {can_download: t.checked} : t.dataset.up ? {can_upload: t.checked} : t.dataset.act ? {active: t.checked} : null;
     if (!body) return;
-    try { await api('/api/users/' + (t.dataset.role || t.dataset.dl || t.dataset.act), 'PUT', body); toast('Opgeslagen'); } catch (err) { toast(err.message, 'err'); }
+    try { await api('/api/users/' + (t.dataset.role || t.dataset.dl || t.dataset.up || t.dataset.act), 'PUT', body); toast('Opgeslagen'); } catch (err) { toast(err.message, 'err'); }
     await load();
   });
   $('#view').onclick = run(async e => {
     const t = e.target;
     if (t.id === 'na') {
       const first = !$('#nr');
-      await api('/api/users', 'POST', {username: $('#nu').value, email: $('#ne').value, password: $('#np').value, role: first ? 'admin' : $('#nr').value, can_download: first ? true : $('#nd').checked});
+      await api('/api/users', 'POST', {username: $('#nu').value, email: $('#ne').value, password: $('#np').value, role: first ? 'admin' : $('#nr').value, can_download: first ? true : $('#nd').checked, can_upload: first ? false : $('#nu2').checked});
       toast('Account aangemaakt');
       if (first) { ME = await api('/api/me'); buildNav(); route(); return; }
       await load();
@@ -796,6 +797,83 @@ V['settings/users'] = async () => {
   });
   await load();
 };
+// ------------------------------------------------------------ uploaden
+function openUpload(cats) {
+  const old = document.querySelector('#upmodal'); if (old && old.remove) old.remove();
+  const el = document.createElement('div'); el.id = 'upmodal';
+  el.style.cssText = 'position:fixed;inset:0;background:#000b;z-index:10;display:flex;align-items:center;justify-content:center';
+  document.body.appendChild(el);
+  const S = {roots: [], root: 0, path: [], q: '', dirs: [], files: [], busy: false, exts: [], max: 0};
+  const close = () => { if (!S.busy || confirm('De upload loopt nog. Toch sluiten?')) el.remove(); };
+  const crumbs = () => [S.roots.find(r => r.id === S.root).name, ...S.path].map((x, i, all) => i === all.length - 1 ? `<b>📁 ${esc(x)}</b>` : `<a href="#" data-crumb="${i}" style="color:#7fb2ff">📁 ${esc(x)}</a>`).join(' <span class="dim">›</span> ');
+  const listHTML = () => {
+    const q = S.q.trim().toLowerCase(), ds = S.dirs.filter(d => !q || d.toLowerCase().includes(q));
+    const row = (attr, txt) => `<div ${attr} style="padding:7px 12px;cursor:pointer;border-bottom:1px solid #2a2f3d">${txt}</div>`;
+    return (S.path.length ? row('data-up="1"', '📁 <span class="dim">.. (een map omhoog)</span>') : '') + ds.map(d => row(`data-dir="${esc(d)}"`, '📁 ' + esc(d))).join('')
+      + (ds.length ? '' : `<div class="dim" style="padding:12px">${S.dirs.length ? 'Geen mappen die passen bij je zoekopdracht' : 'Geen submappen'}</div>`);
+  };
+  const draw = () => {
+    el.innerHTML = `<div style="background:#232733;border-radius:12px;width:min(640px,95vw);max-height:92vh;overflow:auto;padding:22px">
+<h3 style="margin-top:0">Modellen uploaden</h3>
+${S.roots.length ? `<label>Root folder</label><select id="ur" ${S.busy ? 'disabled' : ''}>${S.roots.map(r => `<option value="${r.id}" ${r.id === S.root ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}</select>
+<label>Map</label><div id="ucr" style="margin-bottom:6px">${crumbs()}</div>
+<input id="uq" placeholder="Zoek in deze map…" autocomplete="off" ${S.busy ? 'disabled' : ''} value="${esc(S.q)}">
+<div id="udl" style="margin-top:6px;border:1px solid #3a4052;border-radius:8px;height:210px;overflow:auto;background:#1c1f29">${listHTML()}</div>
+<div class="row" style="margin-top:8px"><input id="unew" placeholder="Of een nieuwe map in deze map (optioneel)" ${S.busy ? 'disabled' : ''}></div>
+<label>Categorie(ën) (optioneel)</label><div class="chips" style="padding:0">${cats.map(c => `<label style="margin-right:12px;white-space:nowrap"><input type="checkbox" data-cat="${c.id}" ${S.busy ? 'disabled' : ''}> ${esc(c.name)}</label>`).join('') || '<span class="dim">Nog geen categorieën</span>'}</div>
+<label>Bestanden</label><input type="file" id="uf" multiple accept="${S.exts.map(e => '.' + e).join(',')}" ${S.busy ? 'disabled' : ''}>
+<small>Toegestaan: ${esc(S.exts.join(', '))}. Maximaal ${S.max} MB per bestand. Een bestand met dezelfde naam wordt nooit overschreven; er komt dan (2) achter.</small>
+<div id="ulist" style="margin-top:10px">${S.files.map((f, i) => `<div class="dim">${esc(f.name)} <span id="us${i}">${f.state || ''}</span></div>`).join('')}</div>`
+      : '<p class="warn">Er is geen beschrijfbare root folder om naartoe te uploaden.</p>'}
+<div class="row" style="margin-top:14px;justify-content:flex-end"><button id="ucl">${S.busy ? 'Sluiten' : 'Klaar'}</button>${S.roots.length ? `<button class="p" id="ugo" ${S.busy ? 'disabled' : ''}>⬆ Uploaden</button>` : ''}</div></div>`;
+  };
+  const loadDirs = async () => { try { S.dirs = (await api(`/api/upload/dirs?root=${S.root}&path=${encodeURIComponent(S.path.join('/'))}`)).dirs; } catch (e) { S.dirs = []; toast(e.message, 'err'); } };
+  const sendOne = (f, folder, catIds) => new Promise(res => {
+    const x = new XMLHttpRequest(), fd = new FormData();
+    fd.append('root', S.root); fd.append('folder', folder); fd.append('categories', catIds.join(',')); fd.append('file', f);
+    x.open('POST', '/api/upload'); x.setRequestHeader('X-Requested-With', 'modelbib');
+    x.upload.onprogress = e => { const o = el.querySelector('#us' + S.files.indexOf(f)); if (o && e.lengthComputable) o.textContent = Math.round(e.loaded / e.total * 100) + '%'; };
+    x.onload = () => { let j = {}; try { j = JSON.parse(x.responseText); } catch (_) {} if (x.status === 401) showLogin(); res(x.status < 300 ? {ok: true, renamed: j.renamed, name: j.name} : {error: j.error || 'Mislukt (' + x.status + ')'}); };
+    x.onerror = () => res({error: 'Verbinding verbroken'});
+    x.send(fd);
+  });
+  el.onclick = run(async e => {
+    const t = e.target;
+    if (t === el || t.id === 'ucl') return close();
+    if (S.busy) return;
+    if (t.closest && t.closest('[data-crumb]')) e.preventDefault();
+    const row = t.closest ? t.closest('[data-dir],[data-up],[data-crumb]') : t, d = row && row.dataset || {};
+    if (d.dir) { S.path.push(d.dir); S.q = ''; await loadDirs(); draw(); }
+    else if (d.up) { S.path.pop(); S.q = ''; await loadDirs(); draw(); }
+    else if (d.crumb !== undefined) { S.path = S.path.slice(0, +d.crumb); S.q = ''; await loadDirs(); draw(); }
+    if (t.id === 'ugo') {
+      const files = [...$('#uf').files];
+      if (!files.length) return toast('Kies eerst een of meer bestanden', 'err');
+      const catIds = [...el.querySelectorAll('[data-cat]')].filter(c => c.checked).map(c => c.dataset.cat);
+      const nw = $('#unew').value.trim(), folder = [...S.path, ...(nw ? [nw] : [])].join('/');
+      S.files = files.map(f => Object.assign(f, {state: ''})); S.busy = true; draw();
+      let ok = 0, bad = 0;
+      for (const f of files) {
+        const o = () => el.querySelector('#us' + S.files.indexOf(f));
+        if (o()) o().textContent = '…';
+        const r = await sendOne(f, folder, catIds);
+        if (r.ok) { ok++; if (o()) o().innerHTML = '✓' + (r.renamed ? ' <span class="dim">(opgeslagen als ' + esc(r.name) + ')</span>' : ''); }
+        else { bad++; if (o()) o().innerHTML = '<span class="warn">✗ ' + esc(r.error) + '</span>'; }
+      }
+      S.busy = false; el.querySelector('#ugo').disabled = false; el.querySelector('#ucl').textContent = 'Klaar';
+      toast(`${ok} geüpload${bad ? `, ${bad} mislukt` : ''}. Ze verschijnen in de bibliotheek zodra de scan ze oppakt.`, bad ? 'err' : undefined);
+    }
+  });
+  el.onchange = run(async e => { if (e.target.id === 'ur' && !S.busy) { S.root = +e.target.value; S.path = []; await loadDirs(); draw(); } });
+  el.oninput = e => { if (e.target.id === 'uq') { S.q = e.target.value; el.querySelector('#udl').innerHTML = listHTML(); } };
+  el.onkeydown = e => { if (e.key === 'Escape') close(); };
+  run(async () => {
+    const r = await api('/api/upload/targets');
+    S.roots = r.roots; S.exts = r.exts; S.max = r.max_mb; S.root = r.roots.length ? r.roots[0].id : 0;
+    if (S.root) await loadDirs();
+    draw();
+  })();
+}
 const bbInfo = sy => !sy || !sy.last ? '' : sy.error ? 'Laatste synchronisatie mislukt: ' + sy.error : `Laatste synchronisatie: ${fdate(sy.last)}. ${sy.result.added} nieuw, ${sy.result.known} al bekend, ${sy.result.unmatched} zonder bijpassend model${sy.result.examples.length ? ' (' + sy.result.examples.join(', ') + ')' : ''}.`;
 V['settings/general'] = async () => {
   $('#title').textContent = 'Instellingen — Algemeen';

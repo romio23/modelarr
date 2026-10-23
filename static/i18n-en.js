@@ -1,6 +1,22 @@
 // Engelse vertaling (gegenereerd). Sleutel = Nederlandse tekst. exact: hele tekst; phrases: zinsdelen binnen een langere tekst; patterns: [regex, vlaggen, vervanging].
 window.I18N_EN = {
 "exact": {
+"Zoek in deze map…": "Search in this folder…",
+".. (een map omhoog)": ".. (one folder up)",
+"Geen mappen die passen bij je zoekopdracht": "No folders match your search",
+"Upload": "Upload",
+"{} uploadde {} naar {}": "{} uploaded {} to {}",
+"Root folder niet gevonden of niet bereikbaar": "Root folder not found or not reachable",
+"Deze root folder is alleen-lezen (niet beschrijfbaar)": "This root folder is read-only (not writable)",
+"Geen bestand ontvangen": "No file received",
+"Categorie bestaat niet meer": "Category no longer exists",
+"Modellen uploaden": "Upload models",
+"Geen submappen": "No subfolders",
+"Categorie(ën) (optioneel)": "Category(ies) (optional)",
+"Bestanden": "Files",
+"Er is geen beschrijfbare root folder om naartoe te uploaden.": "There is no writable root folder to upload to.",
+"Modellen uploaden naar een map en categorie kiezen": "Upload models to a folder and choose a category",
+"Of een nieuwe map in deze map (optioneel)": "Or a new folder in this folder (optional)",
 "Plak hier de sleutel uit Bambuddy": "Paste the key from Bambuddy here",
 "•••••••• (opgeslagen, leeg laten om te behouden)": "•••••••• (saved, leave empty to keep)",
 "Optioneel. Maak in Bambuddy onder Instellingen → API Keys een sleutel. Daarmee kun je een model naar Bambuddy sturen (bibliotheek of wachtrij) en wordt de printgeschiedenis van Bambuddy elke 30 minuten overgenomen in het printlogboek. De sleutel wordt in de database van deze app opgeslagen en nooit teruggestuurd naar de browser.": "Optional. In Bambuddy, create a key under Settings → API Keys. With it you can send a model to Bambuddy (library or queue), and Bambuddy's print history is imported into the print log every 30 minutes. The key is stored in this app's database and is never sent back to the browser.",
@@ -522,6 +538,22 @@ window.I18N_EN = {
 "Zet de app niet rechtstreeks op internet: gebruik daarvoor HTTPS, bijvoorbeeld via de reverse proxy van je NAS. Wachtwoorden worden versleuteld opgeslagen; na 5 foute pogingen is inloggen 10 minuten geblokkeerd.": "Do not expose the app directly to the internet: use HTTPS for that, for example via your NAS reverse proxy. Passwords are stored encrypted; after 5 failed attempts logging in is blocked for 10 minutes."
 },
 "phrases": [
+[
+"Bestandstype niet toegestaan",
+"File type not allowed"
+],
+[
+"Toegestaan:",
+"Allowed:"
+],
+[
+"geen extensie",
+"no extension"
+],
+[
+" uploadde ",
+" uploaded "
+],
 [
 "Bambuddy zet alleen geslicede bestanden (.gcode of .gcode.3mf) in de wachtrij. Dit bestand is niet gesliced: slice het eerst in je slicer en stuur dan dat bestand. In de bibliotheek zetten kan wel.",
 "Bambuddy only queues sliced files (.gcode or .gcode.3mf). This file is not sliced: slice it in your slicer first and then send that file. Putting it in the library is possible."

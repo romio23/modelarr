@@ -1,6 +1,6 @@
 # Modelarr (server version)
 
-> This app was built with the help of [Claude](https://claude.ai) (Anthropic). Yes, I vibecoded it. (Is that a good word?)
+> This app was built with the help of [Claude](https://claude.ai) (Anthropic).
 
 > This is the English version of the documentation. The Dutch original is [README.md](README.md); if the two ever differ, the Dutch one is leading. The app itself can be switched to English with the **EN** button at the bottom left of the navigation.
 
@@ -396,6 +396,7 @@ Without accounts, anyone with access to the address can do everything (the app w
 - **Guest (viewer):** view, search and filter the library, and (set per guest) download models and open them in the slicer. A guest cannot change
   or manage anything, and does not see notes, print log, favorites or the file paths on your disk. Without download permission a guest only sees the thumbnails.
   Guest downloads appear with their name in Activity → History.
+- **Uploading:** set per guest (column "Upload"; administrators always can). Anyone allowed to upload sees the **⬆ Upload** button in the library: choose the root folder and folder (or create a new folder), tick the categories and pick one or more models. A file with an existing name is never overwritten ((2) is added), only allowed file types and files up to `MAX_FILE_MB` are accepted, and nothing is ever written outside the root folder. The root folder must be writable (not mounted `:ro`). The model appears after the next scan (a few seconds) with the chosen categories; uploads show up in Activity → History. A guest with upload permission still cannot change anything else and does not see paths on your disk.
 - **Email address (optional):** you can store an email address with an account; logging in then also works with that address. The app does not send email itself (no mail server is configured).
 - **Security:** passwords are stored encrypted (at least 8 characters), after 5 failed attempts logging in is blocked for 10 minutes (per address), the session cookie
   cannot be read by scripts and requests from other websites are refused. If you change a password or disable an account, the running session expires immediately.

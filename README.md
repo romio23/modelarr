@@ -1,6 +1,6 @@
 # Modelarr (server-versie)
 
-> Deze app is gemaakt met behulp van [Claude](https://claude.ai) (Anthropic). Ja, via vibecode. 
+> Deze app is gemaakt met behulp van [Claude](https://claude.ai) (Anthropic).
 
 > English documentation: [README-EN.md](README-EN.md)
 
@@ -397,6 +397,7 @@ Zonder accounts kan iedereen met toegang tot het adres alles (de app waarschuwt 
 - **Gast (kijker):** de bibliotheek bekijken, zoeken en filteren, en (per gast in te stellen) modellen downloaden en openen in de slicer. Een gast kan niets
   wijzigen of beheren, en ziet geen notities, printlogboek, favorieten of de bestandspaden op je schijf. Zonder download-recht ziet een gast alleen de thumbnails.
   Downloads van gasten komen met hun naam in Activiteit → Geschiedenis.
+- **Uploaden:** per gast in te stellen (kolom "Uploaden"; beheerders mogen altijd). Wie mag uploaden ziet in de bibliotheek de knop **⬆ Uploaden**: kies de root folder en map (of maak een nieuwe map), vink de categorieën aan en kies een of meer modellen. Een bestand met een bestaande naam wordt nooit overschreven (er komt (2) achter), alleen toegestane bestandstypen en bestanden tot `MAX_FILE_MB` worden aangenomen, en er wordt nooit buiten de root folder geschreven. De root folder moet beschrijfbaar zijn (niet `:ro` gekoppeld). Het model verschijnt na de eerstvolgende scan (enkele seconden) met de gekozen categorieën; uploads staan in Activiteit → Geschiedenis. Een gast met upload-recht kan verder niets wijzigen en ziet geen paden op je schijf.
 - **E-mailadres (optioneel):** bij een account kun je een e-mailadres opslaan; inloggen kan dan ook met dat adres. De app verstuurt zelf geen e-mail (er is geen mailserver ingesteld).
 - **Beveiliging:** wachtwoorden zijn versleuteld opgeslagen (minstens 8 tekens), na 5 foute pogingen is inloggen 10 minuten geblokkeerd (per adres), de sessiecookie
   is niet door scripts te lezen en verzoeken vanaf andere websites worden geweigerd. Wijzig je een wachtwoord of zet je een account uit, dan vervalt de lopende sessie direct.

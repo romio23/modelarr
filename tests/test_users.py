@@ -13,14 +13,14 @@ def check(n, ok, extra=''): print('OK  ' if ok else 'FOUT', n, extra); (None if 
 H = {'X-Requested-With': 'modelbib'}; mk = lambda: A.app.test_client()
 admin, anon = mk(), mk()
 basic = lambda u, p: {'Authorization': 'Basic ' + base64.b64encode(f'{u}:{p}'.encode()).decode()}
-check('zonder accounts: iedereen is beheerder, inloggen niet verplicht', anon.get('/api/me').get_json() == {'auth': False, 'user': None, 'role': 'admin', 'can_download': True} and anon.get('/api/library').status_code == 200)
+check('zonder accounts: iedereen is beheerder, inloggen niet verplicht', anon.get('/api/me').get_json() == {'auth': False, 'user': None, 'role': 'admin', 'can_download': True, 'can_upload': True} and anon.get('/api/library').status_code == 200)
 mid = anon.get('/api/library').get_json()['models'][0]['id']; anon.post(f'/api/models/{mid}', json={'notes': 'privé notitie', 'favorite': True})
 check('eerste account: slechte gegevens geweigerd', all(admin.post('/api/users', json=b).status_code == 400 for b in ({'username': 'a b', 'password': 'wachtwoord1'}, {'username': '', 'password': 'wachtwoord1'}, {'username': 'x' * 41, 'password': 'wachtwoord1'}, {'username': 'beheer', 'password': 'kort'})))
 r = admin.post('/api/users', json={'username': 'beheer', 'password': 'geheim-123', 'role': 'viewer'}); me = admin.get('/api/me').get_json()
 check('eerste account wordt altijd beheerder en is meteen ingelogd', r.status_code == 200 and r.get_json()['auto_login'] and me['role'] == 'admin' and me['user'] == 'beheer' and admin.get('/api/library').status_code == 200, me)
 a = anon.get('/api/library')
 check('daarna: anoniem krijgt 401 met login=true, zonder wachtwoordvenster van de browser', a.status_code == 401 and a.get_json()['login'] is True and 'WWW-Authenticate' not in a.headers)
-check('open voor iedereen: inlogpagina, bestanden, ping, /api/me', anon.get('/').status_code == 200 and anon.get('/static/app.js').status_code == 200 and anon.get('/ping').status_code == 200 and anon.get('/api/me').get_json() == {'auth': True, 'user': None, 'role': None, 'can_download': False})
+check('open voor iedereen: inlogpagina, bestanden, ping, /api/me', anon.get('/').status_code == 200 and anon.get('/static/app.js').status_code == 200 and anon.get('/ping').status_code == 200 and anon.get('/api/me').get_json() == {'auth': True, 'user': None, 'role': None, 'can_download': False, 'can_upload': False})
 check('ondertekende links werken zonder account (401 niet van toepassing)', anon.get('/dl/onzin/x.stl').status_code == 403)
 # ---- inloggen en afremmen
 for i in range(5): assert anon.post('/api/login', json={'username': 'beheer', 'password': 'fout'}).status_code == 401
