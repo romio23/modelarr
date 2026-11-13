@@ -1,0 +1,13 @@
+{
+  "name": "modelarr",
+  "title": "Modelarr",
+  "version": "1.4.1",
+  "type": "systemd",
+  "dir": "/opt/modelarr",
+  "keep": ["config"],
+  "service": "modelarr",
+  "venv": "venv",
+  "requirements": "requirements.txt",
+  "health": {"port": 8765, "path": "/", "timeout": 90},
+  "description": "Self-hosted 3D-modelbibliotheek"
+}
