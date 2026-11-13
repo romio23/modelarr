@@ -129,6 +129,16 @@ async function poll() {
 setInterval(poll, 3000);
 
 // ------------------------------------------------------------ bibliotheek
+document.addEventListener('click', async e => {  // download: eerst controleren of het bestand er is, anders een melding in plaats van een opgeslagen HTML-pagina
+  const a = e.target.closest && e.target.closest('a[href^="/api/file/"][download]');
+  if (!a || a.dataset.ok) return;
+  e.preventDefault();
+  try {
+    const r = await fetch(a.getAttribute('href') + '/check', {headers: {'X-Auto': '1'}});
+    if (!r.ok) { let m = 'Downloaden mislukt'; try { m = (await r.json()).error || m; } catch (_) {} return toast(m, 'err'); }
+  } catch (_) { return toast('Geen verbinding met de server', 'err'); }
+  a.dataset.ok = '1'; a.click(); delete a.dataset.ok;
+});
 const L = {view: localStorage.getItem('view') || 'posters', q: '', cat: 'all', ext: 'all', flt: 'all', sort: 'name', sel: new Set(), page: 0, size: (() => { try { const n = parseInt(localStorage.getItem('psize'), 10); return n >= 0 ? n : 100; } catch (e) { return 100; } })(), sig: '', printers: [], logs: {}, spools: null, d: {models: [], categories: [], big_mb: 50, recent_days: 7}};
 const lc = s => String(s ?? '').toLowerCase();
 // past het model op het bed? Afmetingen van het hele model; 90° draaien in het vlak mag. null = afmetingen onbekend.
@@ -174,7 +184,7 @@ function draw() {
 }
 V.library = async () => {
   $('#title').textContent = 'Bibliotheek';
-  $('#tools').innerHTML = `<input id="q" placeholder="Zoeken… (bijv. rack ext:3mf cat:server map:lab)" title="Zoekt in naam, weergavenaam, categorie, extensie, map en 3MF-info. Prefixen: naam: ext: cat: map: ontwerper: notitie: bron:. Gebruik &quot;aanhalingstekens&quot; voor zinnen." value="${esc(L.q)}" style="width:310px"><select id="fc"></select><select id="fe"></select><select id="ff"></select><select id="fs"><option value="name">Sorteer: naam</option><option value="added">Sorteer: toegevoegd</option><option value="size">Sorteer: grootte</option></select><span id="cnt" class="dim"></span><button id="vws"></button>${adm() ? '<button id="upd" class="p">↻ Bijwerken</button>' : ''}${ME.can_upload ? '<button id="upl" title="Modellen uploaden naar een map en categorie kiezen">⬆ Uploaden</button>' : ''}`;
+  $('#tools').innerHTML = `<input id="q" placeholder="Zoeken… (bijv. rack ext:3mf cat:server map:lab)" title="Zoekt in naam, weergavenaam, categorie, extensie, map en 3MF-info. Prefixen: naam: ext: cat: map: ontwerper: kleuren: notitie: bron:. Gebruik &quot;aanhalingstekens&quot; voor zinnen." value="${esc(L.q)}" style="width:310px"><select id="fc"></select><select id="fe"></select><select id="ff"></select><select id="fs"><option value="name">Sorteer: naam</option><option value="added">Sorteer: toegevoegd</option><option value="size">Sorteer: grootte</option></select><span id="cnt" class="dim"></span><button id="vws"></button>${adm() ? '<button id="upd" class="p">↻ Bijwerken</button>' : ''}${ME.can_upload ? '<button id="upl" title="Modellen uploaden naar een map en categorie kiezen">⬆ Uploaden</button>' : ''}`;
   $('#view').innerHTML = '<div id="bulk"></div><div class="pager" id="pg1"></div><div id="items"></div><div class="pager" id="pg2"></div>';
   const sync = () => $('#vws').textContent = L.view === 'posters' ? '☰ Tabel' : '▦ Posters';
   sync(); $('#fs').value = L.sort;
@@ -196,7 +206,7 @@ V.library = async () => {
     const exts = L.d.exts || [...new Set(L.d.models.map(m => m.ext))].sort();
     $('#fe').innerHTML = '<option value="all">Alle formaten</option>' + exts.map(e => `<option value="${e}">${e.toUpperCase()}</option>`).join('');
     $('#fe').value = L.ext; if ($('#fe').value !== L.ext) { L.ext = 'all'; $('#fe').value = 'all'; }
-    $('#ff').innerHTML = `<option value="all">Alle modellen</option><option value="nopreview">Zonder preview</option><option value="recent">Recent toegevoegd (${L.d.recent_days} dgn)</option><option value="big">Groot (&gt; ${L.d.big_mb} MB)</option>${adm() ? '<option value="dup">Dubbele bestanden</option><option value="fav">★ Favorieten</option><option value="toprint">Te printen</option><option value="printed">Geprint</option><option value="failedprint">Eerder mislukt</option>' : ''}` + L.printers.map(p => `<option value="fit:${p.id}">Past op ${esc(p.name)}</option>`).join('');
+    $('#ff').innerHTML = `<option value="all">Alle modellen</option><option value="nopreview">Zonder preview</option><option value="recent">Recent toegevoegd (${L.d.recent_days} dgn)</option><option value="big">Groot (&gt; ${L.d.big_mb} MB)</option><option value="multicolor">Meerkleurig (2+ kleuren)</option>${adm() ? '<option value="dup">Dubbele bestanden</option><option value="fav">★ Favorieten</option><option value="toprint">Te printen</option><option value="printed">Geprint</option><option value="failedprint">Eerder mislukt</option>' : ''}` + L.printers.map(p => `<option value="fit:${p.id}">Past op ${esc(p.name)}</option>`).join('');
     $('#ff').value = L.flt; if ($('#ff').value !== L.flt) { L.flt = 'all'; $('#ff').value = 'all'; }
     if (L.d.ids && L.d.total === L.d.all) L.sel = new Set([...L.sel].filter(id => L.d.ids.includes(id)));  // verwijderde modellen uit de selectie halen
     draw();
@@ -304,10 +314,11 @@ V.library = async () => {
 
 // ------------------------------------------------------------ detailvenster met 3D-viewer
 const cur = () => L.d.models.find(x => x.id === openId) || (L.d.open && L.d.open.id === openId ? L.d.open : undefined);
-const INFO = {title: 'Titel', designer: 'Ontwerper', application: 'Programma', created: 'Aangemaakt', license: 'Licentie', copyright: 'Copyright', printer: 'Printer', layer_height: 'Laaghoogte', nozzle: 'Nozzle', filament: 'Filament', print_time: 'Printtijd', filament_g: 'Filamentverbruik', plates: 'Platen'};
+const INFO = {title: 'Titel', designer: 'Ontwerper', application: 'Programma', created: 'Aangemaakt', license: 'Licentie', copyright: 'Copyright', printer: 'Printer', layer_height: 'Laaghoogte', nozzle: 'Nozzle', filament: 'Filament', print_time: 'Printtijd', filament_g: 'Filamentverbruik', color_count: 'Kleuren', plates: 'Platen'};
 const infoVal = (k, v) => k === 'plates' ? v.length + ' (' + v.map(x => x.name || x.id).join(', ') + ')' : k === 'layer_height' || k === 'nozzle' ? v + ' mm' : k === 'filament_g' ? v + ' g' : k === 'print_time' ? `${Math.floor(v / 3600)}u ${Math.round(v % 3600 / 60)}m` : v;
+const swatches = i => (i.colors || []).map(c => `<span title="${esc(c)}" style="display:inline-block;width:14px;height:14px;border-radius:3px;border:1px solid #fff4;background:${/^#[0-9A-F]{6}$/.test(c) ? c : '#888'};margin-right:3px;vertical-align:-2px"></span>`).join('') + ' ' + i.color_count;
 function infoHTML(m) {
-  const i = m.info || {}, rows = Object.keys(INFO).filter(k => i[k]).map(k => `<tr><td class="dim">${INFO[k]}</td><td>${esc(infoVal(k, i[k]))}</td></tr>`);
+  const i = m.info || {}, rows = Object.keys(INFO).filter(k => i[k]).map(k => `<tr><td class="dim">${INFO[k]}</td><td>${k === 'color_count' ? swatches(i) : esc(infoVal(k, i[k]))}</td></tr>`);
   if (!rows.length && !i.description) return '';
   return `<b>3MF-informatie</b><table class="kv">${rows.join('')}</table>${i.description ? `<div class="info desc">${linkify(i.description)}</div>` : ''}${adm() && i.title && i.title !== m.display ? '<button id="vtitle">Titel overnemen als weergavenaam</button>' : ''}`;
 }
@@ -347,7 +358,7 @@ ${L.d.spoolman ? '<div class="f"><small>Spoolman: verbruik aftrekken van spoel</
 function bbHTML(m) {
   if (!L.d.bambuddy || !['3mf', 'gcode', 'stl'].includes(m.ext)) return '';
   return `<button id="vbbbtn" title="Het model naar Bambuddy sturen">↗ Naar Bambuddy…</button>
-<div id="vbbform" style="display:none"><div class="f"><small>Printer (voor de wachtrij)</small><select id="bbp"><option value="">Laden…</option></select></div>
+<div id="vbbform" style="display:none"><div class="f"><small>Printer (voor de wachtrij)</small><select id="bbp"><option value="">Laden…</option></select></div><div id="bbcol" class="dim" style="margin:0 0 8px"></div>
 <div class="row"><button id="bblib" title="Alleen in de bibliotheek van Bambuddy zetten">In bibliotheek zetten</button><button class="p" id="bbq" title="In de wachtrij van Bambuddy zetten; starten doe je daar zelf" ${m.ext === 'stl' ? 'disabled' : ''}>In wachtrij zetten</button></div>
 <small class="dim">Er wordt niets gestart. Starten doe je zelf in Bambuddy.${m.ext === 'stl' ? ' De wachtrij van Bambuddy neemt alleen geslicede bestanden (.gcode of .gcode.3mf) aan.' : ''}</small></div>`;
 }
@@ -359,6 +370,15 @@ async function openBbForm() {
     if (!r.ok) { $('#bbp').innerHTML = '<option value="">Niet beschikbaar</option>'; return toast(r.error || 'Bambuddy is niet ingesteld', 'err'); }
     $('#bbp').innerHTML = '<option value="">Kies een printer…</option>' + r.printers.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
   } catch (e) { toast(e.message, 'err'); }
+}
+async function showBbColors(pid) {  // de kleuren die nu echt in de gekozen printer zitten (AMS en externe spoel)
+  const box = $('#bbcol'); if (!box) return;
+  if (!pid) { box.innerHTML = ''; return; }
+  box.textContent = 'Laden…';
+  try {
+    const r = await api('/api/bambuddy/colors?printer=' + encodeURIComponent(pid)), sl = ((r.printers || [])[0] || {}).slots || [];
+    box.innerHTML = !r.ok ? esc(r.error || '') : !sl.length ? 'Geen spoelen gevonden in deze printer.' : 'Nu geladen: ' + sl.map(x => `<span title="${esc(x.slot)}" style="white-space:nowrap;margin-right:10px"><span style="display:inline-block;width:12px;height:12px;border-radius:3px;border:1px solid #fff4;background:${/^#[0-9A-F]{6}$/.test(x.hex) ? x.hex : '#888'};vertical-align:-1px"></span> ${esc(x.name)} ${esc(x.material)}</span>`).join('');
+  } catch (e) { box.textContent = ''; }
 }
 async function sendToBambuddy(action) {
   const pid = $('#bbp').value;
@@ -519,7 +539,7 @@ $('#modal').oninput = e => {  // bronlink meteen klikbaar zodra er een geldige l
   const v = e.target.value.trim(), a = $('#vsrcl');
   if (/^https?:\/\//i.test(v)) { a.href = v; a.hidden = false; } else { a.removeAttribute('href'); a.hidden = true; }
 };
-$('#modal').onchange = e => { if (e.target.id === 'vsel') { const n = e.target.value === '__new'; $('#vnew').style.display = n ? '' : 'none'; if (n) $('#vnew').focus(); } };
+$('#modal').onchange = e => { if (e.target.id === 'bbp') showBbColors(e.target.value); if (e.target.id === 'vsel') { const n = e.target.value === '__new'; $('#vnew').style.display = n ? '' : 'none'; if (n) $('#vnew').focus(); } };
 $('#modal').onkeydown = run(async e => { if (e.key === 'Enter' && e.target.id === 'vnew') await addCat(); if (e.key === 'Enter' && (e.target.id === 'vd' || e.target.id === 'vf')) $('#vs').click(); if (e.key === 'Escape') closeModal(); });
 async function addCat() {
   const v = $('#vsel').value; let id;

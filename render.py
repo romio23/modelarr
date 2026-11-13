@@ -351,6 +351,48 @@ _CORE = {'Title': 'title', 'Designer': 'designer', 'Description': 'description',
          'LicenseTerms': 'license', 'License': 'license', 'CreationDate': 'created', 'Application': 'application'}
 
 
+def _hex(c):
+    m = re.fullmatch(r'#?([0-9a-fA-F]{6})(?:[0-9a-fA-F]{2})?', str(c or '').strip())
+    return '#' + m.group(1).upper() if m else None
+
+
+def _colors_3mf(z, files, cfg, ET):
+    """Kleuren die echt gebruikt worden: bij een gesliced Bambu/Orca-project uit slice_info.config (filamenten met verbruik), anders de filamenten
+    waaraan objecten in het project zijn toegewezen (model_settings.config) met de kleuren uit de projectinstellingen. Leeg als er niets te vinden is."""
+    if 'Metadata/slice_info.config' in files:
+        try:
+            seen = {}
+            for f in ET.fromstring(z.read(files['Metadata/slice_info.config'])).iter('filament'):
+                c = _hex(f.get('color'))
+                try:
+                    used = float(f.get('used_g') or f.get('used_m') or 1) > 0
+                except ValueError:
+                    used = True
+                if c and used:
+                    seen.setdefault(f.get('id') or str(len(seen)), c)
+            if seen:
+                return list(dict.fromkeys(seen.values()))
+        except (ET.ParseError, KeyError, ValueError, TypeError):
+            pass  # kapotte slice_info: terugvallen op de projectinstellingen
+    try:
+        pal = cfg.get('filament_colour') or cfg.get('extruder_colour')
+        pal = pal if isinstance(pal, list) else re.split(r'[;,]', str(pal or ''))
+        pal = [_hex(x) for x in pal]
+        if not any(pal):
+            return []
+        used = set()
+        for name in ('Metadata/model_settings.config', 'Metadata/Slic3r_PE_model.config'):
+            if name in files:
+                for m in ET.fromstring(z.read(files[name])).iter('metadata'):
+                    if m.get('key') == 'extruder' and str(m.get('value') or '').isdigit() and int(m.get('value')) > 0:
+                        used.add(int(m.get('value')))
+        used = used or {1}
+        out = [pal[i - 1] for i in sorted(used) if i <= len(pal) and pal[i - 1]]
+        return list(dict.fromkeys(out))
+    except (ET.ParseError, KeyError, ValueError, TypeError):
+        return []
+
+
 def info_3mf(path):
     """Metadata uit een 3MF: titel, ontwerper, programma, licentie, plus slicer-instellingen
     (Bambu Studio / PrusaSlicer) en slice-resultaat (printtijd, filamentgewicht) als die erin zitten.
@@ -407,6 +449,9 @@ def info_3mf(path):
                 out['filament_g'] = round(g, 1)
         except (ET.ParseError, ValueError, TypeError):
             pass
+    cols = _colors_3mf(z, files, cfg, ET)
+    if cols:
+        out['colors'], out['color_count'] = cols, len(cols)
     pls = _plates(z)
     if len(pls) > 1:
         out['plates'] = [{'id': p['id'], 'name': p['name']} for p in pls]

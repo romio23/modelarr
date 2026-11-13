@@ -31,6 +31,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.auth(): return
         if self.path.startswith('/api/v1/queue/'): return self.send(404, {}) if self.path.endswith('/404') or QMISS[0] else self.send(200, dict(id=55, status='pending', printer_id=7, library_file_id=2))
+        if self.path == '/api/v1/printers/7/status': return self.send(200, dict(id=7, connected=True, ams=[dict(id=0, is_ams_ht=False, tray=[dict(id=0, tray_color=None, tray_type=None, exists=False), dict(id=1, tray_color='FFFFFFFF', tray_type='PLA', tray_sub_brands='', remain=-1, exists=True), dict(id=2, tray_color='F98C36FF', tray_type='PLA', tray_sub_brands='Bambu PLA Basic', remain=64, exists=True), dict(id=3, tray_color='00000000', tray_type='PLA', exists=True)])]))
+        if self.path == '/api/v1/printers/8/status': return self.send(200, dict(id=8, connected=True, ams=[dict(id=1, is_ams_ht=True, tray=[dict(id=0, tray_color='F98C36FF', tray_type='PLA', remain=-1, exists=True)])], vt_tray=dict(id=254, tray_color='1F4FD8FF', tray_type='PETG', exists=True)))
         if self.path.startswith('/api/v1/printers/'): return self.send(200, [dict(id=7, name='P1S werkplaats'), dict(id=8, name='X1C')])
         if self.path.startswith('/api/v1/print-log/'):
             q = dict(x.split('=') for x in self.path.split('?')[1].split('&')); o, l = int(q['offset']), int(q['limit'])
@@ -86,6 +88,14 @@ check('juiste sleutel: printers komen terug', st['ok'] and [p['name'] for p in s
 api('/api/settings', 'POST', {'bambuddy_url': URL})
 check('opslaan zonder sleutel behoudt de opgeslagen sleutel', api('/api/bambuddy/status')[1]['ok'])
 check('de bibliotheek meldt dat Bambuddy aanstaat (voor de knop)', api('/api/library')[1]['bambuddy'] is True)
+cl = api('/api/bambuddy/colors')[1]
+check('kleuren: alleen slots met een echte spoel (leeg en doorzichtig tellen niet)', cl['ok'] and [len(p['slots']) for p in cl['printers']] == [2, 2], str([len(p['slots']) for p in cl['printers']]))
+cs = {(c['name'], c['material']): c for c in cl['colors']}
+check('kleuren: namen, materiaal en samengevoegd over printers (oranje zit in twee printers)', set(cs) == {('Wit', 'PLA'), ('Oranje', 'PLA'), ('Blauw', 'PETG')} and sorted(cs[('Oranje', 'PLA')]['printers']) == ['P1S werkplaats', 'X1C'], str(sorted(cs)))
+check('kleuren: resterend alleen als bekend (-1 = onbekend), externe spoel meegenomen', cs[('Wit', 'PLA')]['remain'] is None and cs[('Oranje', 'PLA')]['remain'] == 64 and any(x['slot'] == 'Externe spoel' for p in cl['printers'] for x in p['slots']))
+check('kleuren: één printer opvragen', [p['id'] for p in api('/api/bambuddy/colors?printer=8')[1]['printers']] == [8])
+import app as _A
+check('kleurnamen kloppen bij echte AMS-kleuren uit de praktijk', [_A.bb_color_name(x) for x in ('FFFFFF', '161616', 'F98C36', '00AE42', '1F4FD8')] == ['Wit', 'Zwart', 'Oranje', 'Groen', 'Blauw'])
 
 r = api(f"/api/models/{ids['Rack bracket']}/bambuddy", 'POST', {'action': 'library'})
 check('naar bibliotheek: bestand komt ongewijzigd aan met de juiste naam', r[0] == 200 and LIB[1][0] == '0-Rack bracket.3mf' or LIB[1][0].endswith('Rack bracket.3mf'), str(LIB.get(1, ('?',))[0]))
