@@ -283,6 +283,7 @@ If you use [Bambuddy](https://github.com/maziggy/bambuddy) (self-hosted print ma
 1. In Bambuddy, create a key under **Settings → API Keys** (it is shown only once).
 2. In Modelarr, enter the address (for example `http://192.168.1.20:8000`) and the key under **Settings → General → Bambuddy**. Click **Save** and then **Test connection**.
 - **Sending a model:** open a `.3mf`, `.gcode` or `.stl` model and click **↗ Send to Bambuddy…**. Choose **Put in library**, or pick a printer and choose **Add to queue**. Nothing is ever started: you start it yourself in Bambuddy. Only administrators see this button. **Bambuddy's queue only accepts sliced files** (`.gcode` or a 3MF with G-code inside, i.e. exported as "sliced" from your slicer). An STL or an unsliced 3MF can be put in the library but not in the queue; Modelarr tells you this beforehand.
+- **Colors in the printers:** in the "To Bambuddy…" window, after choosing a printer, you see which spools are really in it now (AMS and external spool), with color name and material. This comes from the printer's status in Bambuddy and also works for spools without RFID; the remaining weight is only known for Bambu RFID spools. The list is also in the API: `GET /api/bambuddy/colors` (optionally `?printer=ID`). The API key in Bambuddy needs the **Read Status** permission for this.
 - **Print history:** every 30 minutes (or with **Sync now**) Bambuddy's print log is imported into Modelarr's print log. An entry is linked to the model with the same name, only if that is unambiguous (with two models of the same name the `.3mf` is chosen; if more remain it is skipped). Successful and failed prints are imported, with printer, weight, time and the reason if any. Prints that are still running or were cancelled, and entries without a matching model, are not imported; they are tried again next time. An entry is imported only once, even if you delete it in Modelarr later.
 - **Filament use and Spoolman:** Bambuddy tracks filament use itself. If you import prints through the sync, do **not** also let Modelarr deduct use from a spool, or it is deducted twice.
 - **Key:** the API key is stored in Modelarr's database (like its own API key) and is never sent back to the browser. **Clear key** turns the integration off.
@@ -304,7 +305,7 @@ If you use [Bambuddy](https://github.com/maziggy/bambuddy) (self-hosted print ma
 
 ## Search and filters
 The search field searches file name, display name, category, extension, folder and 3MF info (designer, title, printer...).
-Multiple words must all match. Limit to one field with a prefix: `naam:` (name) `ext:` `cat:` `map:` (folder) `ontwerper:` (designer),
+Multiple words must all match. Limit to one field with a prefix: `naam:` (name) `ext:` `cat:` `map:` (folder) `ontwerper:` (designer) `kleuren:` (number of colors, e.g. `kleuren:3`),
 for example `rack ext:3mf cat:server map:lab` or `cat:"10 inch"`.
 There are also filters on category, format and: no preview, recently added (default 7 days) and large files
 (default from 50 MB); both thresholds are under Settings → Media management.
@@ -363,6 +364,8 @@ Zip, rar and 7z are not on by default: add them under Settings → Media managem
 ## 3MF information
 From 3MF files the title, designer, application, license and creation date are read, plus (when present) printer, layer height,
 nozzle, filament type and, for Bambu Studio, print time and filament use. Visible in the detail window and searchable.
+
+**Colors:** for a sliced Bambu/Orca project the app counts the filaments that are really used (with consumption). For a project that is not sliced yet it counts the filaments that objects are assigned to; colors that are only painted onto parts of an object do not count then. You see the color swatches and the number in the detail window, search with `kleuren:3` and filter with **Multicolor (2+ colors)**. On the first start after updating, all 3MF files are read once more (in the background); a 3MF without color information shows nothing.
 
 ## Printers and "does this fit my printer?"
 Under Settings → Printers you enter your printers with the bed size (X, Y, Z in mm); there are presets for Bambu Lab

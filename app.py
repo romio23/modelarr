@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import render
 from PIL import Image
 
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.abspath(os.environ.get('CONFIG_DIR', os.path.join(BASE, 'config')))
 BACKUP_ENV = os.environ.get('BACKUP_DIR', '').strip()  # standaard back-upmap (de instelling in de app gaat voor)
@@ -118,6 +118,9 @@ def init():
         c.execute('CREATE TABLE IF NOT EXISTS upload_cats(path TEXT, category_id INTEGER, ts REAL, PRIMARY KEY(path, category_id))')  # gekozen categorieën, toe te passen zodra de scan het model ziet
         c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE) WHERE email IS NOT NULL')
         # 3MF-info met onleesbare HTML-entiteiten (oudere versie) opnieuw laten lezen
+        if not c.execute("SELECT 1 FROM settings WHERE key='info_colors_done'").fetchone():  # eenmalig: kleuren uit 3MF-bestanden lezen (de worker leest de info opnieuw)
+            c.execute("UPDATE models SET info=NULL WHERE ext='3mf'")
+            c.execute("INSERT OR REPLACE INTO settings VALUES('info_colors_done','1')")
         c.execute("UPDATE models SET info=NULL WHERE ext='3mf' AND (info LIKE '%&lt;%' OR info LIKE '%&gt;%' OR info LIKE '%&amp;%' OR info LIKE '%&#%' OR info LIKE '%&quot;%')")
         # Een model dat tijdens een crash/OOM werd verwerkt mag niet eindeloos opnieuw de app laten crashen:
         c.execute("UPDATE models SET thumb_status='failed', thumb_error='Verwerking onderbroken (crash of te weinig geheugen?)' WHERE thumb_status='processing'")
@@ -1433,7 +1436,7 @@ def library():
                    exts=sorted({m['ext'] for m in models}), open=next((m for m in models if m['id'] == want), None) if want else None, **out)
 
 
-_LIB_ALIAS = dict(ext='ext', cat='cat', categorie='cat', map='map', folder='map', naam='naam', name='naam', ontwerper='ontwerper', designer='ontwerper',
+_LIB_ALIAS = dict(kleuren='kleuren', colors='kleuren', colours='kleuren', ext='ext', cat='cat', categorie='cat', map='map', folder='map', naam='naam', name='naam', ontwerper='ontwerper', designer='ontwerper',
                   notitie='notitie', notities='notitie', note='notitie', bron='bron', source='bron')
 
 
@@ -1464,7 +1467,8 @@ def _hay(m, catnames):
     lab = m['display'] or m['name']
     f = dict(naam=s(f"{lab} {m['name']}.{m['ext']}"), ext=s(m['ext']), map=s(m['folder']), ontwerper=s(f"{i.get('designer') or ''} {i.get('title') or ''}"),
              cat=' '.join(catnames.get(c, '') for c in m['cats']).lower(), notitie=s(m['notes']), bron=s(m['source_url']))
-    f['all'] = ' '.join(f.values()) + ' ' + s(' '.join(str(i.get(k) or '') for k in ('application', 'printer', 'filament', 'description')))
+    f['kleuren'] = str(i.get('color_count') or '')
+    f['all'] = ' '.join(v for k, v in f.items() if k != 'kleuren') + ' ' + s(' '.join(str(i.get(k) or '') for k in ('application', 'printer', 'filament', 'description')))
     return f
 
 
@@ -1481,7 +1485,7 @@ def lib_filter(models, categories, q, cat, ext, flt, sort, recent_days, big_mb, 
     fit = beds.get(int(flt[4:])) if flt.startswith('fit:') and flt[4:].isdigit() else None
     tests = {'nopreview': lambda m: m['status'] != 'ok', 'recent': lambda m: m['added'] > now - recent_days * 86400, 'dup': lambda m: bool(m['dup']),
              'fav': lambda m: m['favorite'], 'toprint': lambda m: m['printed'] == 'toprint', 'printed': lambda m: m['printed'] == 'printed',
-             'failedprint': lambda m: m['prints_failed'] > 0, 'big': lambda m: m['size'] > big_mb * 2 ** 20}
+             'failedprint': lambda m: m['prints_failed'] > 0, 'multicolor': lambda m: (m['info'] or {}).get('color_count', 0) >= 2, 'big': lambda m: m['size'] > big_mb * 2 ** 20}
     ft = None if flt == 'all' else (lambda m: fit is not None and _fits(m, fit) is True) if flt.startswith('fit:') else tests.get(flt, tests['big'])
     cid = int(cat) if cat.lstrip('-').isdigit() else None
     out = []
@@ -1507,6 +1511,26 @@ def lib_filter(models, categories, q, cat, ext, flt, sort, recent_days, big_mb, 
     else:
         out.sort(key=_sortkey)
     return out
+
+
+@app.get('/api/file/<int:mid>/check')
+def model_file_check(mid):
+    """Voor de downloadknop: ligt het bestand er nog? Zo niet, een duidelijke melding in plaats van een opgeslagen foutpagina."""
+    r = one(mid)
+    if r['container']:
+        ok = os.path.isfile(r['container'])
+    else:
+        ok = os.path.isfile(r['path'])
+    if ok:
+        return jsonify(ok=True)
+    with db() as c:
+        rp = c.execute('SELECT path FROM roots WHERE id=?', (r['root_id'],)).fetchone()
+    try:
+        down = bool(root_alerts()) or not rp or not os.path.isdir(rp['path']) or next(os.scandir(rp['path']), None) is None
+    except OSError:
+        down = True
+    why = 'De modelmap is niet bereikbaar of leeg (mount offline?). Controleer de share en probeer het opnieuw.' if down else 'Dit bestand staat niet meer op de schijf (verplaatst of verwijderd). Start een scan om de bibliotheek bij te werken.'
+    return jsonify(ok=False, error=why), 404
 
 
 @app.get('/api/file/<int:mid>')
@@ -2567,6 +2591,83 @@ def bambuddy_status():
         return jsonify(configured=True, ok=True, printers=ps, sync=T['bambuddy'])
     except ValueError as e:
         return jsonify(configured=True, ok=False, error=str(e), sync=T['bambuddy'])
+
+
+BB_COLORS = [('Wit', 'FFFFFF'), ('Zwart', '161616'), ('Grijs', '808080'), ('Lichtgrijs', 'C0C0C0'), ('Rood', 'D01F1F'), ('Oranje', 'F98C36'), ('Geel', 'F5D000'), ('Groen', '2EA043'),
+             ('Lichtgroen', '8BD450'), ('Blauw', '1F4FD8'), ('Lichtblauw', '5CC8FF'), ('Turquoise', '00B5AD'), ('Paars', '7B3FBF'), ('Roze', 'FF69B4'), ('Bruin', '7B4A1E'),
+             ('Beige', 'E6D3A3'), ('Goud', 'C9A227'), ('Zilver', 'B0B7BF')]
+
+
+def bb_color_name(hx):
+    """Dichtstbijzijnde kleurnaam (Nederlands) bij een kleurcode: 'F98C36' wordt 'Oranje'. Handig voor kinderen die geen hexcode lezen."""
+    r, g_, b = (int(hx[i:i + 2], 16) for i in (0, 2, 4))
+    return min(BB_COLORS, key=lambda c: (2 * (r - int(c[1][0:2], 16)) ** 2 + 4 * (g_ - int(c[1][2:4], 16)) ** 2 + 3 * (b - int(c[1][4:6], 16)) ** 2))[0]
+
+
+def bb_tray(t, where):
+    """Een AMS-slot of externe spoel uit de printerstatus: alleen als er echt een spoel met een kleur in zit."""
+    if not isinstance(t, dict) or t.get('exists') is False:
+        return None
+    c = re.sub(r'[^0-9A-Fa-f]', '', str(t.get('tray_color') or ''))
+    if len(c) not in (6, 8) or (len(c) == 8 and c[6:].upper() == '00'):  # geen kleur, of volledig doorzichtig = leeg slot
+        return None
+    c = c[:6].upper()
+    mat = str(t.get('tray_type') or '').strip()
+    if not mat:
+        return None
+    rem = t.get('remain')
+    return dict(hex='#' + c, name=bb_color_name(c), material=mat, brand=str(t.get('tray_sub_brands') or '').strip(), slot=where,
+                remain=rem if isinstance(rem, (int, float)) and 0 <= rem <= 100 else None)  # -1 = onbekend (spoel zonder RFID)
+
+
+def bb_slots(status):
+    """Alle spoelen die nu in een printer zitten, uit GET /printers/{id}/status (AMS-eenheden en de externe spoel)."""
+    out = []
+    for u in (status.get('ams') or []) if isinstance(status, dict) else []:
+        if not isinstance(u, dict):
+            continue
+        n = u.get('id')
+        for t in u.get('tray') or []:
+            x = bb_tray(t, f"AMS {n + 1 if isinstance(n, int) and n < 128 else 'HT'} slot {(t.get('id') + 1) if isinstance(t, dict) and isinstance(t.get('id'), int) else '?'}")
+            if x:
+                out.append(x)
+    for k in ('vt_tray', 'external_spool'):
+        v = status.get(k) if isinstance(status, dict) else None
+        for t in (v if isinstance(v, list) else [v]):
+            x = bb_tray(t, 'Externe spoel')
+            if x:
+                out.append(x)
+    return out
+
+
+@app.get('/api/bambuddy/colors')
+def bambuddy_colors():
+    """De kleuren die nu echt in de printers van Bambuddy zitten (AMS en externe spoel), per printer en samengevoegd. Leest alleen, start niets."""
+    if not (CFG['bambuddy_url'] and CFG['bambuddy_key']):
+        return jsonify(configured=False, printers=[], colors=[])
+    want = request.args.get('printer', type=int)
+    try:
+        ps = [p for p in bb_items(bb_call('/printers/', timeout=5), 'items', 'printers') if isinstance(p, dict) and p.get('id') is not None and p.get('is_active', True)]
+        out, merged = [], {}
+        for p in ps:
+            if want is not None and p['id'] != want:
+                continue
+            try:
+                slots = bb_slots(bb_call(f"/printers/{p['id']}/status", timeout=8))
+                err = None
+            except ValueError as e:  # printer offline: de rest blijft werken
+                slots, err = [], str(e)
+            name = str(p.get('name') or p.get('serial_number') or f"Printer {p['id']}")
+            out.append(dict(id=p['id'], name=name, model=p.get('model') or '', slots=slots, error=err))
+            for x in slots:
+                m = merged.setdefault((x['hex'], x['material']), dict(hex=x['hex'], name=x['name'], material=x['material'], brand=x['brand'], printers=[], remain=None))
+                if name not in m['printers']:
+                    m['printers'].append(name)
+                if x['remain'] is not None:
+                    m['remain'] = x['remain'] if m['remain'] is None else max(m['remain'], x['remain'])
+        return jsonify(configured=True, ok=True, printers=out, colors=sorted(merged.values(), key=lambda c: (c['material'], c['name'])))
+    except ValueError as e:
+        return jsonify(configured=True, ok=False, error=str(e), printers=[], colors=[])
 
 
 @app.post('/api/models/<int:mid>/bambuddy')

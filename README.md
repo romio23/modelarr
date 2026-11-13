@@ -284,6 +284,7 @@ Heb je [Bambuddy](https://github.com/maziggy/bambuddy) (zelf gehoste printbeheer
 1. Maak in Bambuddy onder **Instellingen → API Keys** een sleutel (je ziet hem maar één keer).
 2. Vul in Modelarr onder **Instellingen → Algemeen → Bambuddy** het adres (bijv. `http://192.168.1.20:8000`) en de sleutel in. Klik op **Opslaan** en dan op **Verbinding testen**.
 - **Model versturen:** open een `.3mf`-, `.gcode`- of `.stl`-model en klik op **↗ Naar Bambuddy…**. Kies **In bibliotheek zetten** of kies een printer en **In wachtrij zetten**. Er wordt nooit iets gestart: starten doe je zelf in Bambuddy. Alleen beheerders zien deze knop. **De wachtrij van Bambuddy neemt alleen geslicede bestanden aan** (`.gcode` of een 3MF met G-code erin, dus uit je slicer geëxporteerd als "gesliced"). Een STL of een niet-geslicede 3MF kun je wel in de bibliotheek zetten, maar niet in de wachtrij; Modelarr meldt dat vooraf.
+- **Kleuren in de printers:** in het venster "Naar Bambuddy…" zie je na het kiezen van een printer welke spoelen er nu echt in zitten (AMS en externe spoel), met kleurnaam en materiaal. Dat komt uit de status van de printer in Bambuddy en werkt ook voor spoelen zonder RFID; het resterende gewicht is alleen bekend bij Bambu-RFID-spoelen. De lijst staat ook in de API: `GET /api/bambuddy/colors` (optioneel `?printer=ID`). De API-sleutel in Bambuddy heeft hiervoor het recht **Read Status** nodig.
 - **Printgeschiedenis:** elke 30 minuten (of met **Nu synchroniseren**) wordt het printlogboek van Bambuddy overgenomen in het printlogboek van Modelarr. Een regel wordt gekoppeld aan het model met dezelfde naam, alleen als dat eenduidig is (bij twee modellen met dezelfde naam wordt de `.3mf` gekozen; blijven er dan nog meer over, dan wordt hij overgeslagen). Gelukt en mislukt komen binnen, met printer, gewicht, tijd en eventuele reden. Prints die nog bezig zijn of zijn afgebroken, en regels zonder bijpassend model, worden niet overgenomen; bij een volgende keer wordt het opnieuw geprobeerd. Een regel komt maar één keer binnen, ook als je hem in Modelarr later verwijdert.
 - **Verbruik en Spoolman:** Bambuddy houdt zelf het filamentverbruik bij. Haal je prints binnen via de synchronisatie, laat Modelarr dan **geen** verbruik meer van een spoel aftrekken, anders trek je het twee keer af.
 - **Sleutel:** de API-sleutel wordt in de database van Modelarr opgeslagen (net als de eigen API-sleutel) en nooit teruggestuurd naar de browser. Met **Sleutel wissen** zet je de koppeling uit.
@@ -305,7 +306,7 @@ Heb je [Bambuddy](https://github.com/maziggy/bambuddy) (zelf gehoste printbeheer
 
 ## Zoeken en filters
 Het zoekveld zoekt in bestandsnaam, weergavenaam, categorie, extensie, map en 3MF-info (ontwerper, titel, printer...).
-Meerdere woorden moeten allemaal kloppen. Beperk tot een veld met een prefix: `naam:` `ext:` `cat:` `map:` `ontwerper:`,
+Meerdere woorden moeten allemaal kloppen. Beperk tot een veld met een prefix: `naam:` `ext:` `cat:` `map:` `ontwerper:` `kleuren:` (aantal kleuren, bijv. `kleuren:3`),
 bijvoorbeeld `rack ext:3mf cat:server map:lab` of `cat:"10 inch"`.
 Daarnaast filters op categorie, formaat en: zonder preview, recent toegevoegd (standaard 7 dagen) en grote bestanden
 (standaard vanaf 50 MB); beide drempels staan onder Instellingen → Mediabeheer.
@@ -364,6 +365,8 @@ Zip, rar en 7z staan niet standaard aan: voeg ze toe onder Instellingen → Medi
 ## 3MF-informatie
 Uit 3MF-bestanden worden titel, ontwerper, programma, licentie en aanmaakdatum gelezen, plus (als aanwezig) printer, laaghoogte,
 nozzle, filamenttype en bij Bambu Studio ook printtijd en filamentverbruik. Zichtbaar in het detailvenster en doorzoekbaar.
+
+**Kleuren:** bij een gesliced Bambu/Orca-project telt de app de filamenten die echt gebruikt worden (met verbruik). Bij een project dat nog niet gesliced is telt hij de filamenten waaraan objecten zijn toegewezen; kleuren die alleen met verfpenseel op delen van een object zijn aangebracht, tellen dan niet mee. Je ziet de kleurvlakjes en het aantal in het detailvenster, zoekt met `kleuren:3` en filtert met **Meerkleurig (2+ kleuren)**. Bij de eerste start na het bijwerken worden alle 3MF-bestanden eenmalig opnieuw gelezen (op de achtergrond); een 3MF zonder kleurinformatie toont niets.
 
 ## Printers en "past dit op mijn printer?"
 Onder Instellingen → Printers voer je je printers in met de bedgrootte (X, Y, Z in mm); er zijn voorinstellingen voor Bambu Lab

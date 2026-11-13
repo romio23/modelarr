@@ -17,3 +17,10 @@ sv=apiCalls.find(c=>c[0]==='/api/settings'&&c[1]==='POST');
 t('opslaan met ingevulde sleutel stuurt hem (zonder spaties) mee', sv&&sv[2].bambuddy_key==='nieuwe-sleutel');
 apiCalls.length=0; await click({id:'bbsync'});
 t('"Nu synchroniseren" roept de sync aan', apiCalls.some(c=>c[0]==='/api/bambuddy/sync'&&c[1]==='POST'));
+// kleuren die nu in de gekozen printer zitten
+out['#bbcol']=out['#bbcol']||{innerHTML:'',textContent:''};
+apiImpl=async u=>u.startsWith('/api/bambuddy/colors')?{ok:true,printers:[{id:7,slots:[{hex:'#F98C36',name:'Oranje',material:'PLA',slot:'AMS 1 slot 3'},{hex:'#FFFFFF',name:'Wit',material:'PLA',slot:'AMS 1 slot 2'}]}],colors:[]}:{};
+await showBbColors('7');
+t('printerkeuze toont de kleuren die echt geladen zijn', out['#bbcol'].innerHTML.includes('Oranje PLA')&&out['#bbcol'].innerHTML.includes('#F98C36')&&out['#bbcol'].innerHTML.includes('AMS 1 slot 3'));
+await showBbColors('');
+t('geen printer gekozen: lijst leeg', out['#bbcol'].innerHTML==='');
