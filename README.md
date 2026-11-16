@@ -9,6 +9,14 @@ Modelarr beheert je 3D-modellen zoals Sonarr en Radarr je films en series behere
 Beheer je 3D-modellen zoals Sonarr/Radarr je films beheert: root folders, live bestandswachter,
 automatische thumbnails, categorieën, wachtrij/geschiedenis, taken, logs en statuspagina.
 
+## Screenshots
+
+![Bibliotheek](docs/screenshots/modelarr-bibliotheek-demo.png)
+
+| Bibliotheek | Mediabeheer | Printers |
+|---|---|---|
+| ![Bibliotheek](docs/screenshots/modelarr-library.png) | ![Mediabeheer](docs/screenshots/modelarr-mediamanagement.png) | ![Printers](docs/screenshots/modelarr-printers.png) |
+
 ## Windows (zonder Docker of Proxmox)
 1. Installeer Python 3.10+ van python.org (vink "Add python.exe to PATH" aan).
 2. Open `start-windows.bat` met Kladblok en vul `MODELS_DIR` in (bijv. `D:\3D` of `\\nas\modellen`). Daarna dubbelklikken.

@@ -8,6 +8,14 @@ Modelarr manages your 3D models the way Sonarr and Radarr manage your movies and
 
 Root folders, a live file watcher, automatic thumbnails, categories, queue/history, tasks, logs and a status page.
 
+## Screenshots
+
+![Library](docs/screenshots/modelarr-bibliotheek-demo.png)
+
+| Library | Media management | Printers |
+|---|---|---|
+| ![Library](docs/screenshots/modelarr-library.png) | ![Media management](docs/screenshots/modelarr-mediamanagement.png) | ![Printers](docs/screenshots/modelarr-printers.png) |
+
 ## Windows (without Docker or Proxmox)
 1. Install Python 3.10+ from python.org (tick "Add python.exe to PATH").
 2. Open `start-windows.bat` with Notepad and fill in `MODELS_DIR` (e.g. `D:\3D` or `\\nas\models`). Then double-click it.
