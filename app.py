@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import render
 from PIL import Image
 
-VERSION = '1.4.1'
+VERSION = '1.5.0'
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.abspath(os.environ.get('CONFIG_DIR', os.path.join(BASE, 'config')))
 BACKUP_ENV = os.environ.get('BACKUP_DIR', '').strip()  # standaard back-upmap (de instelling in de app gaat voor)
