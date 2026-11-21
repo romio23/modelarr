@@ -484,6 +484,29 @@ async function startViewer(box, m, plate = 0) {
     (function loop() { if (v.stop) return; oc.update(); r.render(sc, cam); requestAnimationFrame(loop); })();
   } catch (e) { if (!v.stop) box.innerHTML = (m.status === 'ok' ? `<div style="text-align:center"><img src="/api/thumb/${m.id}.png?v=${m.thumb_at}" style="max-width:90%;max-height:60vh">` : '<div style="text-align:center">') + `<p class="dim">Geen 3D-weergave voor dit bestand (${esc(e.message)})</p></div>`; }
 }
+// Wachtwoord vragen in een eigen venster: het veld toont stippen (het browservenster prompt() toont de tekst gewoon), met een vakje om het te tonen
+function askPassword(msg, min = 8) {
+  return new Promise(res => {
+    const el = document.createElement('div');
+    el.style.cssText = 'position:fixed;inset:0;background:#000b;z-index:50;display:flex;align-items:center;justify-content:center';
+    el.innerHTML = `<form style="background:var(--bar);border:1px solid var(--bd);border-radius:12px;width:min(440px,92vw);padding:20px;display:flex;flex-direction:column;gap:10px">
+<div>${esc(msg)}</div><input type="password" id="pwi" autocomplete="new-password" style="width:100%">
+<label style="display:flex;gap:8px;align-items:center;font-size:13px"><input type="checkbox" id="pws"> Toon wachtwoord</label>
+<div id="pwe" class="warn" style="display:none"></div>
+<div class="row" style="justify-content:flex-end"><button type="button" id="pwc">Annuleren</button><button class="p" type="submit">OK</button></div></form>`;
+    document.body.appendChild(el);
+    const inp = el.querySelector('#pwi'), done = v => { el.remove(); res(v); };
+    inp.focus();
+    el.querySelector('#pws').onchange = e => { inp.type = e.target.checked ? 'text' : 'password'; };
+    el.querySelector('#pwc').onclick = () => done(null);
+    el.onkeydown = e => { if (e.key === 'Escape') done(null); };
+    el.querySelector('form').onsubmit = e => {
+      e.preventDefault();
+      if (inp.value.length < min) { const m = el.querySelector('#pwe'); m.textContent = `Het wachtwoord moet minstens ${min} tekens hebben`; m.style.display = 'block'; return; }
+      done(inp.value);
+    };
+  });
+}
 const modalDone = async msg => { await reloadLib(); if (openId) $('#side').innerHTML = sideHTML(cur()); toast(msg); };
 $('#modal').onclick = run(async e => {
   const t = e.target;
@@ -825,7 +848,7 @@ V['settings/users'] = async () => {
       await load();
     }
     if (t.dataset.em) { const v = prompt(`E-mailadres van ${t.dataset.n} (leeg laten om te wissen):`, t.dataset.v); if (v === null) return; await api('/api/users/' + t.dataset.em, 'PUT', {email: v}); toast('E-mailadres opgeslagen'); await load(); }
-    if (t.dataset.pw) { const p = prompt(`Nieuw wachtwoord voor ${t.dataset.n} (minstens 8 tekens):`); if (!p) return; await api('/api/users/' + t.dataset.pw, 'PUT', {password: p}); toast('Wachtwoord gewijzigd'); }
+    if (t.dataset.pw) { const p = await askPassword(`Nieuw wachtwoord voor ${t.dataset.n} (minstens 8 tekens):`); if (!p) return; await api('/api/users/' + t.dataset.pw, 'PUT', {password: p}); toast('Wachtwoord gewijzigd'); }
     if (t.dataset.del && confirm(`Account "${t.dataset.n}" verwijderen?`)) { await api('/api/users/' + t.dataset.del, 'DELETE'); toast('Account verwijderd'); await load(); }
     if (t.id === 'nclear' && confirm('Alle accounts verwijderen en inloggen uitzetten?')) { await api('/api/users/clear', 'POST', {confirm: true}); toast('Inloggen staat uit'); ME = await api('/api/me'); buildNav(); route(); }
   });
