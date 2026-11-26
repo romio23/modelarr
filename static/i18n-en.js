@@ -571,6 +571,7 @@ window.I18N_EN = {
 "Alles selecteren": "Select all",
 "Selecteren": "Select",
 "Venster": "Dialog",
+"Acties": "Actions",
 "Toon wachtwoord": "Show password"
 },
 "phrases": [

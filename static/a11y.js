@@ -12,6 +12,8 @@
     const nav = document.getElementById('nav'), main = document.getElementById('main'), toast = document.getElementById('toast');
     if (nav && !nav.hasAttribute('aria-label')) nav.setAttribute('aria-label', 'Hoofdmenu');
     if (main && !main.hasAttribute('role')) main.setAttribute('role', 'main');
+    const title = document.getElementById('title');
+    if (title && !title.hasAttribute('role')) { title.setAttribute('role', 'heading'); title.setAttribute('aria-level', '1'); }
     const view = document.getElementById('view');
     if (view && !view.hasAttribute('tabindex')) view.setAttribute('tabindex', '-1');
     if (toast && !toast.hasAttribute('role')) { toast.setAttribute('role', 'status'); toast.setAttribute('aria-live', 'polite'); }
@@ -41,11 +43,15 @@
     }
     for (const b of root.querySelectorAll('button')) {
       if (b.hasAttribute('aria-label')) continue;
-      const t = b.getAttribute('title');
-      if (t && !/[\p{L}\p{N}]{3,}/u.test(b.textContent)) b.setAttribute('aria-label', t);
+      const t = b.getAttribute('title'), v = b.textContent.trim();
+      if (!t) continue;
+      if (!/[\p{L}\p{N}]/u.test(v)) b.setAttribute('aria-label', t);                       // alleen een pictogram: de titel is de naam
+      else if (v.length < 4 && !t.toLowerCase().includes(v.toLowerCase())) b.setAttribute('aria-label', v + ' – ' + t);  // korte tekst (NL, EN): tekst + uitleg
     }
     for (const i of root.querySelectorAll('img:not([alt])')) i.setAttribute('alt', '');
     for (const h of root.querySelectorAll('th:not([scope])')) h.setAttribute('scope', 'col');
+    for (const h of root.querySelectorAll('th:last-child:empty')) { const sp = document.createElement('span'); sp.className = 'sr-only'; sp.textContent = 'Acties'; h.append(sp); }   // laatste kolom zonder kop = knoppen
+    for (const h of root.querySelectorAll('#view h3:not([aria-level])')) h.setAttribute('aria-level', '2');   // de paginatitel is niveau 1
     for (const a of root.querySelectorAll('nav a.on')) a.setAttribute('aria-current', 'page');
     for (const a of root.querySelectorAll('nav a:not(.on)[aria-current]')) a.removeAttribute('aria-current');
   }
