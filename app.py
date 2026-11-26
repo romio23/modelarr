@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import render
 from PIL import Image
 
-VERSION = '1.6.0'
+VERSION = '1.6.1'
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.abspath(os.environ.get('CONFIG_DIR', os.path.join(BASE, 'config')))
 BACKUP_ENV = os.environ.get('BACKUP_DIR', '').strip()  # standaard back-upmap (de instelling in de app gaat voor)
@@ -22,6 +22,8 @@ os.makedirs(THUMBS, exist_ok=True)
 app = Flask(__name__, static_folder=os.path.join(BASE, 'static'), static_url_path='/static')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 2 ** 20
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', PERMANENT_SESSION_LIFETIME=timedelta(days=30))
+import security
+security.install(app)
 
 # ---------------------------------------------------------------- logging (ringbuffer voor Systeem > Logs)
 LOGS = collections.deque(maxlen=2000)

@@ -7,7 +7,7 @@ import {fileURLToPath} from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const src = fs.readFileSync(path.join(here, '..', 'static', 'app.js'), 'utf8').replace(/\nboot\(\);\s*$/, '\n');  // boot() starten de tests zelf
 if (/\nboot\(\);\s*$/.test(src)) throw new Error('boot() staat nog aan het eind');
-const mkEl = () => ({innerHTML: '', textContent: '', value: '', checked: false, hidden: false, style: {}, dataset: {}, className: '', onclick: null, onkeydown: null, onchange: null, oninput: null,
+const mkEl = () => ({replaceChildren() { this.innerHTML = ''; }, innerHTML: '', textContent: '', value: '', checked: false, hidden: false, style: {}, dataset: {}, className: '', onclick: null, onkeydown: null, onchange: null, oninput: null,
   classList: {add() {}, remove() {}, toggle() {}, contains: () => false}, focus() {}, click() { if (this.onclick) this.onclick({target: this}); }, setAttribute() {}, removeAttribute() {},
   querySelector: () => null, querySelectorAll: () => [], appendChild() {}, addEventListener() {}, getBoundingClientRect: () => ({width: 800, height: 600}), closest: () => null});
 const out = {};
