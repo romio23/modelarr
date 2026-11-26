@@ -566,6 +566,11 @@ window.I18N_EN = {
 "Licht": "Light",
 "Donker": "Dark",
 "Automatisch": "Automatic",
+"Hoofdmenu": "Main menu",
+"Naar de inhoud": "Skip to content",
+"Alles selecteren": "Select all",
+"Selecteren": "Select",
+"Venster": "Dialog",
 "Toon wachtwoord": "Show password"
 },
 "phrases": [

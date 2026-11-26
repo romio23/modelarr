@@ -434,6 +434,7 @@ Without accounts, anyone with access to the address can do everything (the app w
   You cannot delete or demote the last administrator; "Delete all accounts" turns logging in off again.
 - **Sharing on the internet:** only do that via HTTPS (for example your NAS's reverse proxy), because without HTTPS passwords travel unencrypted.
   Behind a reverse proxy all users show the same address, so the block after failed attempts then applies to everyone together.
+- **Security headers:** every page is served with a Content-Security-Policy (scripts only from the app itself, no framing, no plug-ins), `X-Content-Type-Options`, `Referrer-Policy` and a `Permissions-Policy`. Model files and thumbnails get a sandbox policy so they can never run scripts. Requests that change something are refused (403) when the browser says they come from another website (`Sec-Fetch-Site`), on top of the `X-Requested-With` check. Behind an HTTPS reverse proxy (`X-Forwarded-Proto: https`) the session cookie also gets the `Secure` flag and HSTS is sent; over plain http on your own network nothing changes. The policy lives in `security.py`.
 - **Existing login:** a previously configured single login automatically becomes an administrator account on update. `AUTH_USER`/`AUTH_PASS` create an administrator at first start
   if there are no accounts yet. The API key (header `X-Api-Key`) grants administrator rights for integrations; signed download links keep working for 10 minutes without logging in.
 
@@ -548,6 +549,7 @@ Also put the backup folder in a backup outside the house (for example Hyper Back
 
 ## Appearance (light / dark)
 Below the language buttons are three buttons: ☀ light, ☾ dark and **A** automatic (follows your device's light/dark setting). The choice is remembered per browser; without a choice the app stays dark, as before. The login page has the buttons too. Thumbnails stay dark; they are images made by the server.
+- **Accessibility:** the app can be used with the keyboard (Tab, Enter/Space on rows and cards, Escape closes windows, focus stays inside an open window and returns afterwards), has a "Skip to content" link, labelled form fields and a visible focus outline, and follows the "reduce motion" setting of your device. Text colours meet the WCAG AA contrast ratio (4.5:1) in both the dark and the light theme. `static/a11y.js` adds the labels and roles to the screens after they are drawn.
 - The colours are variables at the top of `static/style.css` (`:root` for dark, `:root[data-theme=light]` for light). To change a colour, change it there.
 
 ## Language (Dutch / English)

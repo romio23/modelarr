@@ -46,7 +46,7 @@ function buildNav() {
 }
 $('#nav').onclick = run(async e => { if (themeClick(e)) return; if (e.target.dataset.lang) I18N.setLang(e.target.dataset.lang); if (e.target.id === 'logout') { await api('/api/logout', 'POST'); location.reload(); } });
 const V = {};
-function hideCtx() { const m = $('#ctx'); m.style.display = 'none'; m.innerHTML = ''; }
+function hideCtx() { const m = $('#ctx'); m.style.display = 'none'; m.replaceChildren(); }
 document.addEventListener('click', e => { if (!(e.target.closest && e.target.closest('#ctx'))) hideCtx(); });
 let libKey = null;  // toetsen van de bibliotheek (Ctrl+A, Escape)
 document.addEventListener('keydown', e => { const was = $('#ctx').style.display === 'block'; if (e.key === 'Escape') hideCtx(); if (libKey && !was) libKey(e); });
@@ -95,7 +95,7 @@ async function route() {
   let r = location.hash.replace(/^#\//, '') || 'library';
   r = {activity: 'activity/queue', settings: 'settings/media', system: 'system/status'}[r] || r;
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.r === r));
-  $('#tools').innerHTML = ''; $('#view').onclick = null; $('#view').oncontextmenu = null; $('#view').ontouchstart = $('#view').ontouchmove = $('#view').ontouchend = $('#view').ontouchcancel = null; $('#view').onkeydown = null; $('#view').onchange = null; $('#view').innerHTML = '';
+  $('#tools').replaceChildren(); $('#view').onclick = null; $('#view').oncontextmenu = null; $('#view').ontouchstart = $('#view').ontouchmove = $('#view').ontouchend = $('#view').ontouchcancel = null; $('#view').onkeydown = null; $('#view').onchange = null; $('#view').replaceChildren();
   await run(V[r] || V.library)();
 }
 addEventListener('hashchange', route);
@@ -376,7 +376,7 @@ async function openBbForm() {
 }
 async function showBbColors(pid) {  // de kleuren die nu echt in de gekozen printer zitten (AMS en externe spoel)
   const box = $('#bbcol'); if (!box) return;
-  if (!pid) { box.innerHTML = ''; return; }
+  if (!pid) { box.replaceChildren(); return; }
   box.textContent = 'Laden…';
   try {
     const r = await api('/api/bambuddy/colors?printer=' + encodeURIComponent(pid)), sl = ((r.printers || [])[0] || {}).slots || [];
@@ -402,7 +402,7 @@ async function openLogForm() {
     L.spools = await api('/api/spoolman/spools');
     const types = (((cur().info || {}).filament) || '').toLowerCase().split(/[,;]\s*/).filter(Boolean);
     const fit = s => types.includes(s.material.toLowerCase()) ? 0 : 1;
-    $('#ls').innerHTML = '<option value="">Niet aftrekken</option>' + [...L.spools].sort((a, b) => fit(a) - fit(b)).map(s => `<option value="${s.id}">${esc(s.label)}${s.material ? ' (' + esc(s.material) + ')' : ''}${s.remaining != null ? ' — ' + Math.round(s.remaining) + ' g over' : ''}</option>`).join('');
+    $('#ls').innerHTML = '<option value="">Niet aftrekken</option>' + L.spools.toSorted((a, b) => fit(a) - fit(b)).map(s => `<option value="${s.id}">${esc(s.label)}${s.material ? ' (' + esc(s.material) + ')' : ''}${s.remaining != null ? ' — ' + Math.round(s.remaining) + ' g over' : ''}</option>`).join('');
   } catch (e) { toast(e.message, 'err'); }
 }
 function sideHTMLViewer(m) {  // alleen-lezen weergave voor gasten
@@ -450,7 +450,7 @@ function plateTabs(m, active) {  // tabbladen voor 3MF's met meerdere platen (Ba
 }
 function closeModal() {
   openId = null; if (vw) { vw.stop = true; vw.r && vw.r.dispose(); vw = null; }
-  $('#modal').style.display = 'none'; $('#modal').innerHTML = '';
+  $('#modal').style.display = 'none'; $('#modal').replaceChildren();
 }
 async function startViewer(box, m, plate = 0) {
   const v = vw = {stop: false};
@@ -489,10 +489,10 @@ function askPassword(msg, min = 8) {
   return new Promise(res => {
     const el = document.createElement('div');
     el.style.cssText = 'position:fixed;inset:0;background:#000b;z-index:50;display:flex;align-items:center;justify-content:center';
-    el.innerHTML = `<form style="background:var(--bar);border:1px solid var(--bd);border-radius:12px;width:min(440px,92vw);padding:20px;display:flex;flex-direction:column;gap:10px">
-<div>${esc(msg)}</div><input type="password" id="pwi" autocomplete="new-password" style="width:100%">
+    el.innerHTML = `<form role="dialog" aria-modal="true" aria-labelledby="pwm" style="background:var(--bar);border:1px solid var(--bd);border-radius:12px;width:min(440px,92vw);padding:20px;display:flex;flex-direction:column;gap:10px">
+<div id="pwm">${esc(msg)}</div><input type="password" id="pwi" aria-labelledby="pwm" autocomplete="new-password" style="width:100%">
 <label style="display:flex;gap:8px;align-items:center;font-size:13px"><input type="checkbox" id="pws"> Toon wachtwoord</label>
-<div id="pwe" class="warn" style="display:none"></div>
+<div id="pwe" class="warn" role="alert" style="display:none"></div>
 <div class="row" style="justify-content:flex-end"><button type="button" id="pwc">Annuleren</button><button class="p" type="submit">OK</button></div></form>`;
     document.body.appendChild(el);
     const inp = el.querySelector('#pwi'), done = v => { el.remove(); res(v); };
@@ -566,7 +566,7 @@ $('#modal').oninput = e => {  // bronlink meteen klikbaar zodra er een geldige l
   if (/^https?:\/\//i.test(v)) { a.href = v; a.hidden = false; } else { a.removeAttribute('href'); a.hidden = true; }
 };
 $('#modal').onchange = e => { if (e.target.id === 'bbp') showBbColors(e.target.value); if (e.target.id === 'vsel') { const n = e.target.value === '__new'; $('#vnew').style.display = n ? '' : 'none'; if (n) $('#vnew').focus(); } };
-$('#modal').onkeydown = run(async e => { if (e.key === 'Enter' && e.target.id === 'vnew') await addCat(); if (e.key === 'Enter' && (e.target.id === 'vd' || e.target.id === 'vf')) $('#vs').click(); if (e.key === 'Escape') closeModal(); });
+$('#modal').onkeydown = run(async e => { if (e.isComposing) return; if (e.key === 'Enter' && e.target.id === 'vnew') await addCat(); if (e.key === 'Enter' && (e.target.id === 'vd' || e.target.id === 'vf')) $('#vs').click(); if (e.key === 'Escape') closeModal(); });
 async function addCat() {
   const v = $('#vsel').value; let id;
   if (v === '__new') { const name = $('#vnew').value.trim(); if (!name) return toast('Vul een naam in voor de nieuwe categorie', 'info'); id = (await api('/api/categories', 'POST', {name})).id; }
@@ -656,7 +656,7 @@ function pickFolder(hidden) {  // hidden: ook mappen met een punt tonen (voor de
       $('#func').innerHTML = d.unc ? `Netwerkpad: <code>${esc(d.unc)}</code> <button id="funcb" data-u="${esc(d.unc)}">Dit netwerkpad kiezen</button>`
         : !d.path ? 'Voor een netwerkshare zonder stationsletter: typ hierboven het pad (server én share, bijv. &#92;&#92;nas&#92;modellen) en kies Ga.' : '';
     });
-    const done = v => { m.style.display = 'none'; m.innerHTML = ''; m.onclick = prev; res(v); };
+    const done = v => { m.style.display = 'none'; m.replaceChildren(); m.onclick = prev; res(v); };
     m.onclick = e => {
       const li = e.target.closest('li[data-p]'); if (li) go(li.dataset.p);
       if (e.target.id === 'fgo') go($('#fp').value);
@@ -664,7 +664,7 @@ function pickFolder(hidden) {  // hidden: ook mappen met een punt tonen (voor de
       if (e.target.id === 'fok') { if (!path) return toast('Open eerst een map of typ een pad', 'info'); done(path); }
       if (e.target.id === 'fcx' || e.target.classList.contains('back')) done(null);
     };
-    $('#fp').onkeydown = e => { if (e.key === 'Enter') go(e.target.value); };
+    $('#fp').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) go(e.target.value); };
     go('');
   });
 }
@@ -718,7 +718,7 @@ V['settings/media'] = async () => {
       if (!$('#s11').checked && $('#s11').dataset.was === '1' && !confirm('Zip-bestanden niet meer doorzoeken? De modellen uit zips verdwijnen dan uit de bibliotheek, met hun categorieën en notities.')) return;
       await api('/api/settings', 'POST', {zip_support: $('#s11').checked, scan_interval: $('#s1').value, min_age: $('#s2').value, extensions: $('#s3').value, thumb_size: $('#s4').value, recent_days: $('#s5').value, big_mb: $('#s6').value, thumb_source: $('#s7').value, thumb_delay: $('#s8').value, backup_keep: $('#s9').value, backup_thumbs: $('#s10').checked, backup_dir: $('#s12').value.trim()}); toast('Instellingen opgeslagen'); setTimeout(load, 1500); }
   });
-  $('#view').onkeydown = e => { if (e.key === 'Enter' && e.target.id === 'newroot') $('#addtyped').click(); };
+  $('#view').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing && e.target.id === 'newroot') $('#addtyped').click(); };
   await load();
 };
 V['settings/categories'] = async () => {
@@ -996,9 +996,9 @@ function showLogin(msg) {
   ME = {...ME, user: null};  // sessie weg: stop met pollen
   if (loginUp) { if (msg && $('#le')) $('#le').textContent = msg; return; }  // al zichtbaar: invoer niet wissen
   loginUp = true;
-  $('#nav').innerHTML = ''; $('#top').style.display = 'none'; $('#banner').style.display = 'none'; closeModal();
+  $('#nav').replaceChildren(); $('#top').style.display = 'none'; $('#banner').style.display = 'none'; closeModal();
   $('#view').innerHTML = `<div class="login"><img src="/static/logo.svg" alt="" width="72" height="72" style="align-self:center"><h2 style="text-align:center;margin:0">Model<span style="color:var(--link)">arr</span></h2><p class="dim">Log in om verder te gaan.</p><input id="lu" placeholder="Gebruikersnaam of e-mailadres" autocomplete="username"><input id="lp" type="password" placeholder="Wachtwoord" autocomplete="current-password"><button class="p" id="lb">Inloggen</button><div class="err" id="le">${esc(msg || '')}</div>${langBlock()}${themeBlock()}</div>`;
   const go = async () => { try { await api('/api/login', 'POST', {username: $('#lu').value, password: $('#lp').value}); location.reload(); } catch (e) { $('#le').textContent = e.message; } };
-  $('#view').onclick = e => { if (themeClick(e)) return; if (e.target.dataset.lang) I18N.setLang(e.target.dataset.lang); }; $('#lb').onclick = go; $('#view').onkeydown = e => { if (e.key === 'Enter') go(); }; $('#lu').focus();
+  $('#view').onclick = e => { if (themeClick(e)) return; if (e.target.dataset.lang) I18N.setLang(e.target.dataset.lang); }; $('#lb').onclick = go; $('#view').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) go(); }; $('#lu').focus();
 }
 boot();

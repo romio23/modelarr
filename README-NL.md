@@ -435,6 +435,7 @@ Zonder accounts kan iedereen met toegang tot het adres alles (de app waarschuwt 
   Je kunt de laatste beheerder niet verwijderen of degraderen; "Alle accounts verwijderen" zet het inloggen weer uit.
 - **Op internet delen:** doe dat alleen via HTTPS (bijvoorbeeld de reverse proxy van je NAS), want zonder HTTPS reizen wachtwoorden onversleuteld.
   Achter een reverse proxy zien alle gebruikers hetzelfde adres, dus de blokkade na foute pogingen geldt dan voor iedereen samen.
+- **Beveiligingsheaders:** elke pagina krijgt een Content-Security-Policy (scripts alleen van de app zelf, niet in een frame, geen plug-ins), `X-Content-Type-Options`, `Referrer-Policy` en een `Permissions-Policy`. Modelbestanden en thumbnails krijgen een sandbox-beleid, zodat ze nooit scripts kunnen draaien. Verzoeken die iets wijzigen worden geweigerd (403) als de browser meldt dat ze van een andere website komen (`Sec-Fetch-Site`), naast de controle op `X-Requested-With`. Achter een https-reverse proxy (`X-Forwarded-Proto: https`) krijgt de sessiecookie ook het `Secure`-kenmerk en wordt HSTS meegestuurd; over gewoon http op je eigen netwerk verandert er niets. Het beleid staat in `security.py`.
 - **Bestaande inlog:** een eerder ingestelde enkele inlog wordt bij de update automatisch een beheerdersaccount. `AUTH_USER`/`AUTH_PASS` maken bij de eerste start
   een beheerder aan als er nog geen accounts zijn. De API-sleutel (header `X-Api-Key`) geeft beheerdersrechten voor koppelingen; ondertekende downloadlinks blijven 10 minuten werken zonder inloggen.
 
@@ -550,6 +551,7 @@ Zet de back-upmap ook in een back-up buiten het huis (bijvoorbeeld Hyper Backup 
 
 ## Weergave (licht / donker)
 Onder de taalknoppen staan drie knoppen: ☀ licht, ☾ donker en **A** automatisch (volgt het licht/donker-instelling van je apparaat). De keuze wordt per browser onthouden; zonder keuze blijft de app donker, zoals voorheen. Ook de inlogpagina heeft de knoppen. De thumbnails blijven donker; ze zijn plaatjes die de server maakt.
+- **Toegankelijkheid:** de app is met het toetsenbord te bedienen (Tab, Enter/spatie op rijen en kaarten, Escape sluit vensters, de focus blijft in een open venster en keert daarna terug), heeft een link "Naar de inhoud", velden met een label en een zichtbare focusrand, en volgt de instelling "minder beweging" van je apparaat. De tekstkleuren halen in het donkere en het lichte thema de WCAG AA-contrastverhouding (4,5:1). `static/a11y.js` zet de labels en rollen op de schermen nadat ze getekend zijn.
 - De kleuren staan als variabelen bovenaan `static/style.css` (`:root` voor donker, `:root[data-theme=light]` voor licht). Wil je een kleur aanpassen, dan doe je dat daar.
 
 ## Taal (Nederlands / English)
